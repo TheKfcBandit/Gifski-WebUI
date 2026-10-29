@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from engine import Engine, DEFAULTS, gif_dimensions
+from engine import Cancelled, Engine, DEFAULTS, gif_dimensions
 
 # A valid 1 × 1 transparent GIF is sufficient for path/command validation.
 GIF = base64.b64decode('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7')
@@ -72,7 +72,7 @@ class EngineTests(unittest.TestCase):
         s = dict(self.settings, source={'kind': 'sequence', 'paths': paths}, fps=20, speed=2, noSort=True)
         p = self.engine.plan(s)
         self.assertEqual(p['pipeline'], 'sequence')
-        self.assertEqual(p['commands'][0][-2:], paths)
+        self.assertEqual(p['commands'][0][-2:], [str(Path(x).resolve()) for x in paths])
         self.assertEqual(p['commands'][0][p['commands'][0].index('--fps') + 1], '40')
         self.assertNotIn('--fast-forward', p['commands'][0])
 
@@ -121,11 +121,12 @@ class EngineTests(unittest.TestCase):
         original = copy.deepcopy(settings)
         jid = 'estimated'
         self.engine.jobs[jid] = {'results': [], 'mode': 'estimate'}
-        def encode(jid, trial, index, total):
+        trials = []
+        def encode(jid, trial, index, total, record=True):
+            self.assertFalse(record)
+            trials.append(copy.deepcopy(trial))
             span = (trial['trim']['end'] - trial['trim']['start']) / trial['speed']
-            result = {'index': index, 'bytes': int(span * 1000), 'settings': copy.deepcopy(trial)}
-            self.engine.jobs[jid]['results'].append(result)
-            return result
+            return {'index': index, 'bytes': int(span * 1000), 'settings': copy.deepcopy(trial)}
         with patch.object(self.engine, 'probe', return_value={'duration': 100}), patch.object(self.engine, '_encode', side_effect=encode):
             self.engine._estimate(jid, settings)
         job = self.engine.jobs[jid]
@@ -135,10 +136,26 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(estimate['exact'])
         self.assertLess(estimate['lowerBytes'], 30000)
         self.assertGreater(estimate['upperBytes'], 30000)
+        self.assertEqual(estimate['sampledSeconds'], 1.5)
         self.assertIsNone(job['bestIndex'])
+        self.assertEqual(job['results'], [])
         self.assertEqual(settings, original)
-        ranges = [(r['settings']['trim']['start'], r['settings']['trim']['end']) for r in job['results']]
-        self.assertEqual(ranges, [(4, 7), (32.5, 35.5), (61, 64)])
+        ranges = [(r['trim']['start'], r['trim']['end']) for r in trials]
+        self.assertEqual(ranges, [(4, 5), (33.5, 34.5), (63, 64)])
+
+    def test_estimate_cache_reuses_matching_recipe_and_invalidates_source_change(self):
+        settings = self.engine._normalize(self.settings)
+        jid = 'cache'
+        self.engine.jobs[jid] = {'results': [], 'mode': 'estimate'}
+        with patch.object(self.engine, '_encode', return_value={'bytes': 1000}) as encode:
+            first = self.engine._sample_summary(jid, settings, {'duration': 30})
+            second = self.engine._sample_summary(jid, settings, {'duration': 30})
+            self.assertEqual(encode.call_count, 3)
+            self.assertFalse(first['cacheHit'])
+            self.assertTrue(second['cacheHit'])
+            self.source.write_bytes(GIF + b'changed')
+            self.engine._sample_summary(jid, settings, {'duration': 30})
+            self.assertEqual(encode.call_count, 6)
 
     def test_short_estimate_is_exact_complete_encode(self):
         settings = self.engine._normalize(dict(self.settings, trim={'start': 1, 'end': 3}))
@@ -155,7 +172,7 @@ class EngineTests(unittest.TestCase):
     def test_discord_baseline_keeps_aspect_and_caps_source_rate(self):
         settings = self.engine._normalize(self.settings)
         base, width, fps = self.engine._discord_settings(settings, {'width': 800, 'height': 1600, 'fps': 120})
-        self.assertEqual(width, 640)
+        self.assertEqual(width, 800)
         self.assertIsNone(base['height'])
         self.assertEqual(fps, 50)
         self.assertEqual(base['pipeline'], 'png')
@@ -179,8 +196,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(job['targetBytes'], 20_000_000)
         self.assertEqual(job['bestIndex'], 0)
         self.assertTrue(job['results'][0]['fit'])
-        self.assertFalse(job['results'][1]['fit'])
-        self.assertEqual(len(job['results']), 8)
+        self.assertEqual(len(job['results']), 1)  # Maximum source-quality fit needs no more trials.
         self.assertTrue(all(r['settings']['fps'] <= 50 for r in job['results']))
 
     def test_discord_sequence_resamples_without_changing_input_timing(self):
@@ -195,6 +211,118 @@ class EngineTests(unittest.TestCase):
         args = self.engine._ffmpeg(base, paths[0], 'output.png', 'png', 'frame%06d.png')
         self.assertEqual(args[args.index('-framerate') + 1], '40')
         self.assertIn('fps=25', args[args.index('-vf') + 1])
+
+    def test_smart_samples_never_substitute_for_full_size_verification(self):
+        settings = self.engine._normalize(dict(self.settings, smart={'targetMB': 1, 'effort': 'quick'}))
+        jid = 'smart-fit'
+        self.engine.jobs[jid] = {'results': [], 'mode': 'smart'}
+        def estimate(jid, trial, metadata):
+            # Deliberately optimistic estimates: first full export must fail.
+            return {'estimatedBytes': int(700_000 * (trial['width'] / 1000) ** 2 * (trial['fps'] / 30) * trial['quality'] / 100)}
+        def encode(jid, trial, index, total):
+            size = int(1_200_000 * (trial['width'] / 1000) ** 2 * (trial['fps'] / 30) * trial['quality'] / 100)
+            result = {'index': index, 'bytes': size, 'settings': copy.deepcopy(trial)}
+            self.engine.jobs[jid]['results'].append(result)
+            return result
+        with patch.object(self.engine, 'probe', return_value={'width': 1000, 'height': 600, 'fps': 30, 'duration': 30}), patch.object(self.engine, '_sample_summary', side_effect=estimate), patch.object(self.engine, '_encode', side_effect=encode):
+            self.engine._discord(jid, settings)
+        job = self.engine.jobs[jid]
+        self.assertEqual(job['targetBytes'], 1_000_000)
+        self.assertFalse(job['results'][0]['fit'])
+        best = job['results'][job['bestIndex']]
+        self.assertTrue(best['fit'])
+        self.assertLessEqual(best['bytes'], 1_000_000)
+        self.assertLessEqual(len(job['results']), 4)
+        self.assertLessEqual(job['search']['sampleTrials'], 5)
+        self.assertNotIn('global optimum.', job['searchNote'].split('not')[0])
+
+    def test_smart_no_fit_does_not_report_success(self):
+        settings = self.engine._normalize(dict(self.settings, smart={'targetMB': .001, 'effort': 'quick'}))
+        jid = 'no-fit'
+        self.engine.jobs[jid] = {'results': [], 'mode': 'smart'}
+        def encode(jid, trial, index, total):
+            result = {'index': index, 'bytes': 2000 - index, 'settings': copy.deepcopy(trial)}
+            self.engine.jobs[jid]['results'].append(result)
+            return result
+        with patch.object(self.engine, 'probe', return_value={'width': 1000, 'height': 600, 'fps': 30}), patch.object(self.engine, '_encode', side_effect=encode):
+            self.engine._discord(jid, settings)
+        job = self.engine.jobs[jid]
+        self.assertTrue(all(not result['fit'] for result in job['results']))
+        self.assertIn('No tested candidate fits', job['searchNote'])
+        self.assertEqual(job['bestIndex'], len(job['results']) - 1)
+
+    def test_smart_rejects_nonfinite_limits_and_invalid_effort(self):
+        for smart in ({'targetMB': float('nan')}, {'targetMB': float('inf')}, {'targetMB': 0}, {'effort': 'forever'}):
+            with self.subTest(smart=smart), self.assertRaises(ValueError):
+                self.engine._normalize(dict(self.settings, smart=smart))
+
+    def test_diminishing_quality_returns_preserve_detail(self):
+        score = self.engine._fidelity_score
+        self.assertGreater(score(1000, 30, 90, 1000, 30), score(850, 30, 100, 1000, 30))
+        self.assertGreater(score(1000, 30, 100, 1000, 30), score(1000, 30, 90, 1000, 30))
+
+    def test_quality_refinement_reuses_preprocessed_frames(self):
+        settings = self.engine._normalize(self.settings)
+        jid = 'cached-frames'
+        (self.engine.outputs / jid).mkdir()
+        self.engine.jobs[jid] = {'id': jid, 'results': [], 'mode': 'encode'}
+        calls = []
+        def run(jid, command, cwd=None):
+            calls.append(command)
+            if '--output' in command:
+                Path(command[command.index('--output') + 1]).write_bytes(GIF)
+            else:
+                for i in range(2):
+                    Path(command[-1].replace('%06d', f'{i:06d}')).write_bytes(b'png')
+        with patch.object(self.engine, '_run', side_effect=run):
+            self.engine._encode(jid, settings, 0, 2)
+            settings['quality'] = 75
+            self.engine._encode(jid, settings, 1, 2)
+        self.assertEqual(sum('--output' not in cmd for cmd in calls), 1)
+        self.assertEqual(sum('--output' in cmd for cmd in calls), 2)
+        self.assertEqual(self.engine.jobs[jid]['search']['frameCacheHits'], 1)
+
+    def test_cached_estimation_still_honors_cancellation(self):
+        settings = self.engine._normalize(self.settings)
+        jid = 'cancel-estimate'
+        self.engine.jobs[jid] = {'results': [], 'mode': 'estimate'}
+        with patch.object(self.engine, '_encode', return_value={'bytes': 1000}) as encode:
+            self.engine._sample_summary(jid, settings, {'duration': 30})
+            self.engine.cancelled.add(jid)
+            with self.assertRaises(Cancelled):
+                self.engine._sample_summary(jid, settings, {'duration': 30})
+            self.assertEqual(encode.call_count, 3)
+
+    def test_thorough_extra_effort_must_also_meet_measured_limit(self):
+        settings = self.engine._normalize(dict(self.settings, smart={'targetMB': 1, 'effort': 'thorough'}))
+        jid = 'extra-check'
+        self.engine.jobs[jid] = {'results': [], 'mode': 'smart'}
+        def encode(jid, trial, index, total):
+            size = 1_000_001 if trial['effort'] == 'extra' else 999_999
+            result = {'index': index, 'bytes': size, 'settings': copy.deepcopy(trial)}
+            self.engine.jobs[jid]['results'].append(result)
+            return result
+        with patch.object(self.engine, 'probe', return_value={'width': 320, 'height': 180, 'fps': 20, 'duration': 1}), patch.object(self.engine, '_encode', side_effect=encode):
+            self.engine._discord(jid, settings)
+        job = self.engine.jobs[jid]
+        self.assertEqual(len(job['results']), 2)
+        self.assertTrue(job['results'][0]['fit'])
+        self.assertFalse(job['results'][1]['fit'])
+        self.assertEqual(job['bestIndex'], 0)
+
+    def test_input_protocols_and_frame_count_are_bounded(self):
+        command = self.engine.plan(self.settings)['commands'][0]
+        self.assertEqual(command[command.index('-protocol_whitelist') + 1], 'file,pipe')
+        self.assertEqual(command[command.index('-frames:v') + 1], '100001')
+
+    def test_malformed_persisted_config_and_jobs_are_ignored(self):
+        self.engine.config_path.write_text('[]')
+        folder = self.engine.outputs / 'broken'
+        folder.mkdir()
+        (folder / 'job.json').write_text('[]')
+        reopened = Engine(self.root)
+        self.assertEqual(reopened.config, {})
+        self.assertEqual(reopened.jobs, {})
 
     def test_restart_marks_unfinished_jobs_interrupted(self):
         folder = self.root / 'data' / 'jobs' / 'abc'

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import threading
 import urllib.parse
@@ -37,6 +38,7 @@ class Server(ThreadingHTTPServer):
         self.preview = preview
         self.sources = set()
         self.source_lock = threading.Lock()
+        self.operation_lock = threading.RLock()
 
 
     def invalidate_tools(self):
@@ -48,11 +50,14 @@ class Server(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(60)
+
     def log_message(self, fmt, *args):
         # Avoid noisy polling and leaking complete local paths into terminal logs.
-        if args and isinstance(args[0], str) and '/api/jobs' in args[0]:
-            return
-        super().log_message(fmt, *args)
+        # Query strings can contain private local paths. Keep request logs off.
+        return
 
     def headers_common(self):
         self.send_header('X-Content-Type-Options', 'nosniff')
@@ -71,6 +76,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def allowed_host(self):
+        if len(self.headers.get_all('Host', [])) != 1:
+            return False
         host = self.headers.get('Host', '')
         if self.server.preview:
             return bool(host)
@@ -92,8 +99,13 @@ class Handler(BaseHTTPRequestHandler):
             return False
         origin = self.headers.get('Origin')
         if origin:
-            parsed = urllib.parse.urlsplit(origin)
-            if parsed.netloc != self.headers.get('Host') or parsed.scheme not in ('http', 'https'):
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                valid = (parsed.netloc == self.headers.get('Host') and parsed.scheme in ('http', 'https')
+                         and not parsed.path and not parsed.query and not parsed.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
                 self.send_json({'error': 'Cross-origin requests are not allowed.'}, 403)
                 return False
         if self.headers.get('Sec-Fetch-Site') == 'cross-site':
@@ -101,19 +113,49 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def body_length(self, maximum):
+        lengths = self.headers.get_all('Content-Length', [])
+        if self.headers.get('Transfer-Encoding') or len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,12}', lengths[0]):
+            self.close_connection = True
+            raise ValueError('A single valid Content-Length is required; chunked requests are not supported.')
+        count = int(lengths[0])
+        if not 0 < count <= maximum:
+            self.close_connection = True
+            raise ValueError('Invalid request size.')
+        return count
+
     def body_json(self):
         if self.headers.get('Content-Type', '').split(';')[0].strip() != 'application/json':
+            self.close_connection = True
             raise ValueError('Expected application/json.')
-        count = int(self.headers.get('Content-Length', '0'))
-        if not 0 < count <= MAX_JSON:
-            raise ValueError('Invalid JSON request size.')
-        value = json.loads(self.rfile.read(count))
+        count = self.body_length(MAX_JSON)
+        raw = self.rfile.read(count)
+        if len(raw) != count:
+            self.close_connection = True
+            raise ValueError('Request body interrupted.')
+        def invalid_number(value):
+            raise ValueError('JSON numbers must be finite.')
+        try:
+            value = json.loads(raw, parse_constant=invalid_number)
+        except (RecursionError, UnicodeDecodeError) as e:
+            raise ValueError('Invalid JSON encoding or nesting.') from e
         if not isinstance(value, dict):
             raise ValueError('Expected a JSON object.')
         return value
 
+    @staticmethod
+    def object_field(body, key, fallback=None):
+        value = body.get(key, fallback)
+        if not isinstance(value, dict):
+            raise ValueError(f'{key} must be an object.')
+        return value
+
     def register_source(self, source):
+        if not isinstance(source, dict):
+            raise ValueError('Source must be an object.')
         paths = source.get('paths', []) if source.get('kind') == 'sequence' else [source.get('path')]
+        if not isinstance(paths, list) or any(path is not None and not isinstance(path, str) for path in paths):
+            raise ValueError('Source paths must be strings.')
         with self.server.source_lock:
             for path in paths:
                 if path:
@@ -188,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.guard():
                 return
             if route == '/api/dependencies':
-                return self.send_json(self.server.dependencies.status())
+                return self.send_json(self.server.dependencies.status(self.server.engine.status().get('tools', {})))
             if route == '/api/status':
                 return self.send_json(self.server.engine.status())
             if route == '/api/jobs':
@@ -207,6 +249,8 @@ class Handler(BaseHTTPRequestHandler):
                     allowed = path in self.server.sources
                 if not allowed:
                     return self.send_json({'error': 'Select and inspect this media file first.'}, 403)
+                if str(Path(path).resolve()) != path:
+                    return self.send_json({'error': 'Source changed. Select and inspect it again.'}, 409)
                 return self.send_file(path)
             if route == '/api/features':
                 return self.send_json({'text': (ROOT / 'FEATURES.md').read_text('utf-8')})
@@ -225,8 +269,9 @@ class Handler(BaseHTTPRequestHandler):
         route = urllib.parse.urlsplit(self.path).path
         try:
             if route == '/api/upload':
-                length = int(self.headers.get('Content-Length', '0'))
-                if not 0 < length <= MAX_UPLOAD:
+                try:
+                    length = self.body_length(MAX_UPLOAD)
+                except ValueError:
                     self.close_connection = True
                     return self.send_json({'error': 'Upload must be between 1 byte and 20 GiB. Use a local path for larger files.'}, 413)
                 name = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('name', ['media'])[0]
@@ -236,6 +281,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({'error': 'Choose a video, GIF, Y4M or PNG file.'}, 400)
                 directory = ROOT / 'data/uploads' / secrets.token_hex(8)
                 directory.mkdir(parents=True, exist_ok=True)
+                if shutil.disk_usage(directory).free < length + 64 * 1024 ** 2:
+                    directory.rmdir()
+                    self.close_connection = True
+                    return self.send_json({'error': 'Insufficient disk space for an upload copy. Use a local path instead.'}, 413)
                 target = directory / name
                 try:
                     with target.open('xb') as f:
@@ -248,35 +297,54 @@ class Handler(BaseHTTPRequestHandler):
                             remaining -= len(block)
                 except Exception:
                     target.unlink(missing_ok=True)
+                    directory.rmdir()
                     raise
                 self.register_source({'path': str(target)})
                 return self.send_json({'path': str(target), 'name': name, 'bytes': length})
             body = self.body_json()
+            if route == '/api/status/refresh':
+                self.server.invalidate_tools()
+                return self.send_json(self.server.engine.status())
+            if route == '/api/dependencies/check-updates':
+                self.server.invalidate_tools()
+                return self.send_json(self.server.dependencies.check_updates(self.server.engine.status().get('tools', {})), 202)
             if route == '/api/dependencies/install':
-                return self.send_json(self.server.dependencies.install(body.get('tool')), 202)
+                with self.server.operation_lock:
+                    if any(job.get('status') in ('queued', 'running') for job in self.server.engine.list_jobs()):
+                        return self.send_json({'error': 'Finish or cancel queued jobs before installing tools.'}, 409)
+                    return self.send_json(self.server.dependencies.install(body.get('tool')), 202)
             if route == '/api/config':
-                return self.send_json(self.server.engine.configure(body))
+                with self.server.operation_lock:
+                    if self.server.dependencies.status()['busy'] or any(job.get('status') in ('queued', 'running') for job in self.server.engine.list_jobs()):
+                        return self.send_json({'error': 'Finish active jobs and installations before changing executable paths.'}, 409)
+                    return self.send_json(self.server.engine.configure(body))
             if route == '/api/probe':
-                source = body.get('source', body)
+                source = self.object_field(body, 'source', body)
                 result = self.server.engine.probe(source)
                 self.register_source(source)
                 if result.get('path'):
                     self.register_source({'path': result['path']})
                 return self.send_json(result)
             if route == '/api/plan':
-                return self.send_json(self.server.engine.plan(body.get('settings', body)))
+                return self.send_json(self.server.engine.plan(self.object_field(body, 'settings', body)))
             if route == '/api/jobs':
-                settings = body.get('settings', {})
-                result = self.server.engine.submit(settings, body.get('mode', 'encode'))
+                settings = self.object_field(body, 'settings', {})
+                self.object_field(settings, 'source', {})
+                with self.server.operation_lock:
+                    if self.server.dependencies.status()['busy']:
+                        return self.send_json({'error': 'Wait for the dependency installation to finish before starting a job.'}, 409)
+                    result = self.server.engine.submit(settings, body.get('mode', 'encode'))
                 self.register_source(settings.get('source', {}))
                 return self.send_json(result, 201)
             match = re.fullmatch(r'/api/jobs/([A-Za-z0-9_-]+)/cancel', route)
             if match:
                 return self.send_json(self.server.engine.cancel(match[1]))
             return self.send_json({'error': 'Not found.'}, 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True
             pass
         except (ValueError, KeyError, IndexError, FileNotFoundError, json.JSONDecodeError) as e:
+            self.close_connection = True
             self.send_json({'error': str(e)}, 400)
         except Exception as e:
             self.send_json({'error': str(e)}, 500)

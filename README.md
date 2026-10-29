@@ -1,6 +1,6 @@
 # Gifski WebUI
 
-A local browser interface for Gifski and FFmpeg. Tune every Gifski CLI encoding option, compare real outputs, estimate file size, and search for a GIF that fits a size limit.
+A local browser interface for Gifski and FFmpeg. Choose a preset, estimate file size, or let Smart find a high-quality GIF within your size limit. Advanced mode exposes every Gifski CLI encoding option.
 
 ## Start
 
@@ -26,18 +26,22 @@ Automatic portable installation is Windows x64 only. The setup wizard gives manu
 
 ## Workflow
 
-1. **Choose a source.** Pick a video or PNG sequence, drag files into the source area, or use a local path to avoid making an upload copy. FFprobe reports source dimensions, duration, and frame rate.
-2. **Frame and time it.** Trim, crop, and choose dimensions/FPS. Match-source controls copy the corresponding source values. Leave one dimension blank to preserve aspect ratio. Setting both can stretch.
-3. **Choose a preset.** Start with Balanced, Compact, Fidelity, UI & text, Motion, Transparent, or Discord. Save custom recipes and export/import JSON backups.
-4. **Estimate or encode.** Size estimation uses real sample encodes and shows a range. A sample estimate is not a file-size guarantee; an exact short-clip measurement is identified separately.
-5. **Compare.** Sweep overall quality, dimensions, FPS, and independent motion/lossy quality settings. Pin results for side-by-side viewing and inspect actual byte counts, settings, and commands.
-6. **Fit a limit.** Target-size search uses complete encodes. It keeps the candidates and clearly reports when none meet the budget.
+1. **Choose a source.** Drop a video or PNG sequence, choose files, or enter a local path to avoid making an upload copy.
+2. **Choose a preset.** Default is a balanced starting point. Smart accepts your file-size limit; Discord fixes it at 20 MB. Other presets contains Compact, Fidelity, UI & text, Motion, Transparent, and saved recipes. Custom exposes everyday tuning; Advanced exposes all encoder and preprocessing options.
+3. **Set the clip.** Keep the full source or adjust trimming. Width, height, FPS, and trim end have source-match controls where applicable.
+4. **Create the GIF.** Ordinary presets encode directly. Smart and Discord screen short samples, then encode promising candidates in full. The selected output, measured size, and download are shown first; other verified attempts are available in a collapsed list.
 
-### Discord: 20 MB maximum
+History and dependency settings are secondary views. There is no separate comparison workspace or size-fitting tab. Saved presets can be imported/exported as JSON.
 
-The Discord preset derives its starting dimensions and frame rate from the source, then searches a bounded set of resolution, FPS, and quality candidates. The cap is **20,000,000 bytes**, not 20 MiB. Only a fully rendered GIF at or below that byte count is marked as fitting.
+### Smart and Discord
 
-This is a configurable workflow preset, not a claim about every Discord account's current upload limit. A file may still need smaller dimensions, a shorter duration, or a larger search budget. The selected candidate is the best found by the documented search preference, not a measured perceptual optimum.
+Smart uses a customizable **decimal MB** limit. Discord uses exactly **20,000,000 bytes**, not 20 MiB. Both use the same search engine and keep trimming, crop, playback, and image-processing choices. A limit is satisfied only when a complete resulting GIF is measured at or below it.
+
+Search effort controls the time budget; Thorough can also verify Extra encoder effort on a fitting candidate. Representative short samples screen candidate settings before full verification; samples and reusable preprocessing are cached during a session. The search tests significant spatial and temporal changes before spending time on small quality refinements. It stops when further tested improvements are negligible or its budget is exhausted. No search shortens your chosen clip to fit.
+
+The selected result is the best verified candidate under the documented settings preference, not a perceptual-quality measurement or a guarantee of a global optimum. A no-fit result is explicit. Difficult clips may require a smaller resolution, a shorter duration, or a larger limit. Discord is a convenient 20 MB preset, not a claim about every account's upload allowance.
+
+Size estimates are previews: short clips may be measured completely; longer clips use separated short samples and display an uncertainty range. Unchanged recipes can reuse cached estimates. Estimates never replace the final byte check.
 
 ### Understand quality and size
 
@@ -52,7 +56,7 @@ This is a configurable workflow preset, not a claim about every Discord account'
 
 **Gifski:** overall/motion/lossy quality, normal/fast/extra effort, width/height, frame rate, speed, repeats, bounce, frame order, fixed palette colors, matte, Y4M matrix interpretation, quiet output, file naming, help, and version.
 
-**FFmpeg preprocessing:** trim, crop, scaling filter, FPS conversion, speed, reverse, denoise, sharpen, and custom filter chains. Advanced controls are grouped into expandable sections. See [FEATURES.md](FEATURES.md) for the option-by-option inventory and limitations.
+**FFmpeg preprocessing:** trim, crop, scaling filter, FPS conversion, speed, reverse, denoise, sharpen, and custom filter chains. Advanced controls are grouped by framing, image processing, encoder quality, color, playback, and pipeline. See [FEATURES.md](FEATURES.md) for the option-by-option inventory and limitations.
 
 | Pipeline | Use |
 |---|---|
@@ -67,6 +71,10 @@ Gifski has no CLI dither-strength, palette-size, thread-count, or resize-kernel 
 The installer uses fixed trusted sources: the official ImageOptim Gifski release and the Gyan FFmpeg release build linked from FFmpeg's download page. Archives are size-limited, checked against published SHA-256 information, and extracted only for the required executables. Source URLs and installation progress are visible. If verification or installation fails, choose installed executable paths instead. Downloads do not run arbitrary install scripts.
 
 Gifski and FFmpeg are separate programs with their own licenses. No encoder binaries are tracked in this repository.
+
+### Version checks
+
+**Settings → Check updates** compares the active Gifski, FFmpeg, and FFprobe versions with official stable releases. Checks run only when requested and are cached for 15 minutes. Nightly or vendor-specific versions are reported as uncertain when they cannot be compared reliably. Installing a portable update does not replace a separately configured executable; clear that path to use the portable copy.
 
 ## Local data and privacy
 
@@ -93,10 +101,11 @@ Node is optional and only needed for the JavaScript syntax check. Unit tests use
 |---|---|
 | `server.py` | Local HTTP API and static files |
 | `engine.py` | Probing, pipelines, queue, estimates, and optimization |
-| `dependencies.py` | Portable dependency installation |
+| `dependencies.py` | Portable installation and on-demand version checks |
 | `static/` | Browser UI |
 | `test_*.py` | Engine, HTTP, and installer tests |
 | `FEATURES.md` | Gifski feature coverage |
+| `DESIGN.md` | Layout philosophy, search strategy, and hardening boundaries |
 
 ## References
 

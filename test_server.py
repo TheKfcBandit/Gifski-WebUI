@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import socket
 import unittest
 from unittest.mock import patch
 from urllib.parse import quote
@@ -33,6 +34,12 @@ class FakeEngine:
     def configure(self, data):
         self.calls.append(('configure', data))
         return {'config': data}
+
+    def plan(self, data):
+        return {'settings': data}
+
+    def submit(self, data, mode='encode'):
+        return {'settings': data, 'mode': mode}
 
     def probe(self, source):
         path = source.get('path') or source['paths'][0]
@@ -86,6 +93,28 @@ class HTTPTests(unittest.TestCase):
             self.assertTrue(json.loads(data)['busy'])
             install.assert_called_once_with('gifski')
 
+    def test_update_check_contract_and_origin_guard(self):
+        with patch.object(self.http.dependencies, 'check_updates', create=True, return_value={'updates': {'state': 'checking'}}) as check:
+            code, _, data = self.json_post('/api/dependencies/check-updates', {})
+            self.assertEqual(code, 202)
+            self.assertEqual(json.loads(data)['updates']['state'], 'checking')
+            check.assert_called_once_with({})
+        self.assertEqual(self.json_post('/api/dependencies/check-updates', {}, auth=False)[0], 401)
+
+    def test_explicit_installed_version_refresh_invalidates_status(self):
+        with patch.object(self.http, 'invalidate_tools') as invalidate:
+            self.assertEqual(self.json_post('/api/status/refresh', {})[0], 200)
+            invalidate.assert_called_once_with()
+        self.assertEqual(self.json_post('/api/status/refresh', {}, auth=False)[0], 401)
+
+    def test_tool_changes_and_job_submission_do_not_overlap(self):
+        with patch.object(self.engine, 'list_jobs', return_value=[{'status': 'running'}]):
+            self.assertEqual(self.json_post('/api/dependencies/install', {'tool': 'gifski'})[0], 409)
+            self.assertEqual(self.json_post('/api/config', {'gifski': 'new'})[0], 409)
+        with patch.object(self.http.dependencies, 'status', return_value={'busy': True}):
+            self.assertEqual(self.json_post('/api/jobs', {'settings': {'source': {}}})[0], 409)
+            self.assertEqual(self.json_post('/api/config', {'ffmpeg': 'new'})[0], 409)
+
     def request(self, method, path, body=None, auth=True, headers=None):
         h = {'Connection': 'close'}
         if auth:
@@ -134,6 +163,40 @@ class HTTPTests(unittest.TestCase):
     def test_json_contract_rejects_form_posts_and_non_objects(self):
         self.assertEqual(self.request('POST', '/api/config', 'gifski=evil', headers={'Content-Type': 'application/x-www-form-urlencoded'})[0], 400)
         self.assertEqual(self.request('POST', '/api/config', '[]', headers={'Content-Type': 'application/json'})[0], 400)
+
+    def test_rejects_invalid_numbers_nested_types_and_origins(self):
+        for raw in ('{"fps":NaN}', '{"fps":Infinity}', '[' * 1100 + '0' + ']' * 1100):
+            self.assertEqual(self.request('POST', '/api/plan', raw, headers={'Content-Type': 'application/json'})[0], 400)
+        for route, body in (('/api/probe', {'source': []}), ('/api/plan', {'settings': 'bad'}), ('/api/jobs', {'settings': {'source': None}})):
+            self.assertEqual(self.json_post(route, body)[0], 400)
+        for origin in ('http://[invalid', 'null', f'http://{self.host}/unexpected'):
+            self.assertEqual(self.json_post('/api/config', {}, headers={'Origin': origin})[0], 403)
+
+    def test_ambiguous_framing_is_rejected_and_connection_closed(self):
+        for extra in ('Content-Length: 2\r\nContent-Length: 2', 'Content-Length: 2\r\nTransfer-Encoding: chunked'):
+            with socket.create_connection(('127.0.0.1', self.http.server_port), timeout=3) as conn:
+                wire = f'POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\nContent-Type: application/json\r\n{extra}\r\n\r\n{{}}'
+                conn.sendall(wire.encode())
+                chunks = []
+                while True:
+                    block = conn.recv(8192)
+                    if not block:
+                        break
+                    chunks.append(block)
+                response = b''.join(chunks)
+                self.assertIn(b'400 Bad Request', response)
+
+    def test_rejected_body_closes_keep_alive_connection(self):
+        with socket.create_connection(('127.0.0.1', self.http.server_port), timeout=3) as conn:
+            wire = f'POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}'
+            conn.sendall(wire.encode())
+            response = b''
+            while True:
+                block = conn.recv(8192)
+                if not block:
+                    break
+                response += block
+            self.assertIn(b'400 Bad Request', response)
 
     def test_only_registered_media_can_be_previewed(self):
         source = self.root / 'clip.mp4'
