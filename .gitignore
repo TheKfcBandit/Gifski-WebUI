@@ -8,3 +8,13 @@ venv/
 .env.*
 .DS_Store
 Thumbs.db
+
+# Local release packaging and maintainer utilities
+/Publish-*.cmd
+/Update-Repository-Info.cmd
+/scripts/update-repository-info.py
+/.github/repository.json
+/Gifski-WebUI.bundle
+/Gifski-WebUI*.zip
+/build/
+/dist/

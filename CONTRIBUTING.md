@@ -21,3 +21,13 @@ Keep changes focused and explain the resulting behavior and validation. Follow [
 
 Never include personal media, `data/`, `bin/`, absolute local paths, tokens, or unredacted logs in a commit or report. A small generated test clip is preferable to a private input file. Report bugs with the app revision, OS, Python/encoder versions, reproduction steps, and a redacted error.
 
+## Commit privacy
+
+Keep release bundles and local publishing utilities outside the tracked source. Review staged files before committing. Configure a nonpersonal identity in this checkout before publishing; repository-local configuration does not change global Git settings.
+
+```sh
+git config --local user.name "Gifski WebUI"
+git config --local user.email "maintainers@gifski-webui.invalid"
+```
+
+Commit metadata includes both author and committer identity. Editing the latest files or adding a mailmap does not remove identities from existing commit objects.

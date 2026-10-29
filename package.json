@@ -1,7 +1,7 @@
 {
   "name": "gifski-webui",
   "private": true,
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Local Gifski and FFmpeg interface with size targeting, resolution and FPS locks, saved presets, and encoder controls.",
   "scripts": {
     "dev": "python3 server.py --preview --no-browser"

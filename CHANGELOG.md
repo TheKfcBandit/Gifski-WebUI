@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1
+
+- Remove maintainer-only publishing utilities from tracked source.
+- Exclude local release packages and document repository-local commit privacy settings.
+
 ## 1.5.0
 
 - Store saved presets and interface preferences in the application runtime folder. Source/CMD launches are portable; frozen Windows launches use LocalAppData. Legacy browser presets require explicit import or clearing.
