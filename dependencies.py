@@ -146,19 +146,30 @@ def release_version(value):
     return tuple(int(part or 0) for part in match.groups()) if match else None
 
 
-def installed_version(tool, value):
-    """Return the release base and vendor marker; snapshots cannot be ordered."""
+def installed_build(tool, value):
+    """Identify upstream release bases without treating Git snapshots as releases."""
     prefix = r'gifski\s+' if tool == 'gifski' else re.escape(tool) + r'\s+version\s+'
-    match = re.match(prefix + r'(\S+)', value, re.IGNORECASE)
+    match = re.search(r'^\s*\ufeff?' + prefix + r'(\S+)', value, re.IGNORECASE | re.MULTILINE)
     token = match[1] if match else ''
-    # Git snapshots and prereleases may contain a release number but do not
-    # identify a released build. Never call these current or outdated.
-    if re.search(r'(?:git|snapshot|nightly|alpha|beta|rc\d|-[0-9]+-g[0-9a-f])', token, re.I):
-        return None, True
-    base = re.match(r'v?(\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)(?=$|[-+])', token)
-    if not base or re.match(r'[-+]dev(?:\d|[.-]|$)', token[base.end():], re.I):
-        return None, True
-    return release_version(base[1]), bool(token[base.end():])
+    # Official FFmpeg tag builds use the n prefix. BtbN adds YYYYMMDD to
+    # exact tag builds; Gyan, Ubuntu, Debian and others add vendor suffixes.
+    prefix = 'v?' if tool == 'gifski' else '[nv]?'
+    base = re.match(prefix + r'(\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)(?=$|[-+])', token, re.I)
+    base_version = base[1] if base else ''
+    result = {'token': token, 'kind': 'unknown', 'baseVersion': base_version, 'comparable': None}
+    if re.search(r'(?:^N-\d+-g[0-9a-f]+|(?:^|[-+])(?:git|snapshot|nightly|dev|dirty)(?:$|[-+.\d])|-\d+-g[0-9a-f]+)', token, re.I):
+        result['kind'] = 'snapshot'
+    elif re.search(r'(?:^|[-+.])(?:alpha|beta|rc)(?:$|[-+.\d])', token, re.I):
+        result['kind'] = 'prerelease'
+    elif base:
+        result.update(kind='vendor' if token[base.end():] else 'stable', comparable=release_version(base_version))
+    return result
+
+
+def installed_version(tool, value):
+    """Compatibility helper returning an orderable stable base and vendor marker."""
+    build = installed_build(tool, value)
+    return build['comparable'], build['kind'] != 'stable'
 
 
 def _safe_name(name):
@@ -255,7 +266,9 @@ class DependencyManager:
         self.checked_at = None
         self.checked_monotonic = None
         self.check_state = 'idle'
+        self.check_phase = ''
         self.check_cached = False
+        self.refresh_error = ''
         self.installed_tools = {}
         self.setup = {'state': 'idle', 'remaining': [], 'message': ''}
         self.supported = platform.system() == 'Windows' and platform.machine().lower() in ('amd64', 'x86_64')
@@ -276,6 +289,8 @@ class DependencyManager:
             wanted = [name] if name == 'gifski' else ['ffmpeg', 'ffprobe']
             item['installed'] = all((self.root / 'bin' / f'{tool}.exe').is_file() for tool in wanted)
             item['available'] = all(installed.get(tool, {}).get('available', False) for tool in wanted)
+            item['portableUpdateAffectsActive'] = all(
+                not installed.get(tool, {}).get('available') or self._is_portable_active(installed[tool]) for tool in wanted)
         return {'platform': f'{platform.system()} {platform.machine()}', 'supported': self.supported,
                 'busy': setup['state'] == 'installing' or any(t['state'] in ('queued', 'installing') for t in tools.values()),
                 'tools': tools, 'updates': updates, 'setup': setup, 'destination': 'bin/',
@@ -287,66 +302,107 @@ class DependencyManager:
         with self.lock:
             self.tools[tool].update(values)
 
+    def _is_portable_active(self, local):
+        if not local.get('available'):
+            return False
+        if local.get('origin') in ('local', 'portable'):
+            return True
+        path = local.get('path')
+        if not path:
+            return False
+        try:
+            return Path(path).resolve().parent == (self.root / 'bin').resolve()
+        except (OSError, ValueError, RuntimeError):
+            return False
+
     def _update_status(self):
         """Caller holds the lock. Reading status never accesses the network."""
         tools = {}
         for name in ('gifski', 'ffmpeg', 'ffprobe'):
             upstream = 'gifski' if name == 'gifski' else 'ffmpeg'
             local = self.installed_tools.get(name, {})
-            version = str(local.get('version') or '')[:240]
+            version = str(local.get('version') or '')[:1000]
+            build = installed_build(name, version)
+            origin = local.get('origin', '')
+            origin = 'configured' if origin in ('config', 'explicit') else origin
+            origin_label = {'path': 'PATH', 'configured': 'the configured path', 'local': 'the app folder',
+                            'portable': 'the app folder'}.get(origin, 'the selected executable')
+            portable = self._is_portable_active(local)
             latest = self.release_cache.get(upstream, '')
             item = {'state': 'not_checked', 'installedVersion': version,
                     'latestVersion': latest, 'errorCode': None, 'sourceUsed': '',
+                    'installedOrigin': origin, 'installedPath': str(local.get('path') or '')[:4096],
+                    'installedKind': build['kind'], 'installedBaseVersion': build['baseVersion'],
+                    'versionToken': build['token'], 'comparisonScope': 'upstream_stable',
+                    'updateMethod': 'portable' if portable else 'external',
+                    'updateHint': ('The app-local installer updates this executable in bin/.' if portable and self.supported
+                                   else f'Update the active {name} installation with its original package manager or installer. A portable copy does not replace an external PATH or configured installation.'),
                     'sourceUrl': ('https://github.com/ImageOptim/gifski/releases' if upstream == 'gifski'
                                   else 'https://ffmpeg.org/download.html'),
-                    'message': 'Check updates to compare with the latest upstream release.'}
+                    'message': (f'Detected through {origin_label}. Check updates to compare with the latest upstream stable release.'
+                                if local.get('available') else 'No working executable is selected. Scan tools or set an executable path.')}
             item.update(self.release_sources.get(upstream, {}))
-            if upstream in self.check_pending:
+            if self.refresh_error:
+                item.update(state='error', errorCode='local_detection', message=self.refresh_error)
+            elif upstream in self.check_pending and self.check_phase == 'installed':
+                item.update(state='checking', message='Refreshing the active installed executable and version…')
+            elif upstream in self.check_pending:
                 item.update(state='checking', message='Checking the official release source…')
             elif upstream in self.release_errors:
                 item.update(state='error', **self.release_errors[upstream])
             elif latest:
-                local_version, vendor = installed_version(name, version)
+                local_version = build['comparable']
                 remote_version = release_version(latest)
                 if not local.get('available'):
-                    item.update(state='not_installed', message='No working executable is selected.')
+                    item.update(state='not_installed', message='No working executable was detected. Scan tools or set a path; restart the app after changing system PATH.')
+                elif build['kind'] == 'snapshot':
+                    item.update(state='unknown', message=f'Detected through {origin_label}: a Git, nightly, or development build. Stable release {latest} is shown for reference; this build cannot be marked current or outdated by that comparison. Check its build provider for nightly updates.')
+                elif build['kind'] == 'prerelease':
+                    item.update(state='unknown', message=f'Detected through {origin_label}: a prerelease build. Its version cannot be reliably ordered against stable release {latest}.')
                 elif local_version is None or remote_version is None:
-                    item.update(state='unknown', message='This custom, development, or unrecognized build cannot be compared reliably with stable releases.')
+                    item.update(state='unknown', message=f'The executable works through {origin_label}, but its version banner is not recognized. Check the installed version shown here or its build provider.')
                 elif local_version < remote_version:
-                    item.update(state='update_available', message='A newer upstream release is available. OS and vendor packages may carry their own fixes.')
+                    item.update(state='update_available', message=f'Detected through {origin_label}. A newer upstream stable release is available. OS and vendor packages may carry their own fixes.')
                 elif local_version > remote_version:
-                    item.update(state='newer', message='This executable reports a version newer than the latest upstream stable release.')
-                elif vendor:
-                    item.update(state='unknown', message='Based on the latest upstream release; vendor-specific revisions cannot be verified here.')
+                    item.update(state='newer', message=f'Detected through {origin_label}. This executable reports an upstream version newer than the latest stable release.')
+                elif build['kind'] == 'vendor':
+                    item.update(state='current', message=f'Detected through {origin_label}. Matches the latest upstream stable release. Vendor rebuilds and package-specific revisions are checked separately by its package manager or build provider.')
                 else:
-                    item.update(state='current', message='Matches the latest upstream stable release.')
+                    item.update(state='current', message=f'Detected through {origin_label}. Matches the latest upstream stable release.')
             tools[name] = item
         return {'state': self.check_state, 'checkedAt': self.checked_at,
-                'cached': self.check_cached, 'tools': tools}
+                'phase': self.check_phase, 'cached': self.check_cached, 'tools': tools}
 
-    def check_updates(self, installed_tools=None):
+    def check_updates(self, installed_tools=None, refresh_installed=None):
         """Explicit user action; metadata only, cached to avoid provider rate limits."""
+        if refresh_installed is not None and not callable(refresh_installed):
+            raise ValueError('The installed-tool refresh must be callable.')
         with self.lock:
             if installed_tools is not None:
                 self.installed_tools = copy.deepcopy(installed_tools)
             if self.check_state == 'checking':
                 return self.status()
-            if (self.checked_monotonic is not None
+            use_cache = (self.checked_monotonic is not None
                     and time.monotonic() - self.checked_monotonic < UPDATE_CACHE_SECONDS
-                    and self.check_state == 'completed'):
+                    and self.check_state == 'completed')
+            if use_cache and refresh_installed is None:
                 self.check_cached = True
                 return self.status()
             self.check_state = 'checking'
+            self.check_phase = 'installed' if refresh_installed is not None else 'upstream'
             self.check_cached = False
+            self.refresh_error = ''
             self.check_pending = {'gifski', 'ffmpeg'}
-            self.release_cache = {}
-            self.release_errors = {}
-            self.release_sources = {}
+            if not use_cache:
+                self.release_cache = {}
+                self.release_errors = {}
+                self.release_sources = {}
         try:
-            threading.Thread(target=self._check_worker, daemon=True, name='check-updates').start()
+            threading.Thread(target=self._check_worker, args=(refresh_installed, use_cache), daemon=True, name='check-updates').start()
         except RuntimeError:
             with self.lock:
                 self.check_state = 'failed'
+                self.check_phase = ''
                 self.check_pending.clear()
                 self.release_errors = {tool: {'errorCode': 'startup', 'message': 'Could not start the update check. Try again.'}
                                        for tool in ('gifski', 'ffmpeg')}
@@ -415,12 +471,35 @@ class DependencyManager:
             raise ValueError('No stable FFmpeg release tags were found.')
         return max(versions, key=release_version)
 
-    def _check_worker(self):
+    def _check_worker(self, refresh_installed=None, use_cache=False):
         # Publish each independent result immediately. A slow source must not
         # hide another tool's version or make checks take the sum of timeouts.
+        if refresh_installed is not None:
+            try:
+                installed = refresh_installed()
+                if not isinstance(installed, dict) or any(not isinstance(value, dict) for value in installed.values()):
+                    raise ValueError('Invalid local tool snapshot.')
+                with self.lock:
+                    self.installed_tools = copy.deepcopy(installed)
+            except Exception:
+                with self.lock:
+                    self.check_state = 'failed'
+                    self.check_phase = ''
+                    self.check_pending.clear()
+                    self.refresh_error = 'Could not refresh the active installed tools. Check executable paths, keep the launcher open, and retry. Restart the app after changing system PATH.'
+                return
+        if use_cache:
+            with self.lock:
+                self.check_state = 'completed'
+                self.check_phase = ''
+                self.check_pending.clear()
+                self.check_cached = True
+            return
         with self.lock:
             self.check_state = 'checking'
+            self.check_phase = 'upstream'
             self.check_pending = {'gifski', 'ffmpeg'}
+            self.refresh_error = ''
             self.release_cache = {}
             self.release_errors = {}
             self.release_sources = {}
@@ -453,6 +532,7 @@ class DependencyManager:
             self.checked_at = time.time()
             self.checked_monotonic = time.monotonic()
             self.check_state = 'completed' if not self.release_errors else ('partial' if self.release_cache else 'failed')
+            self.check_phase = ''
 
     def install(self, tool):
         if tool not in self.tools:

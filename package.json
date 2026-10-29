@@ -1,7 +1,9 @@
 {
   "name": "gifski-webui",
   "private": true,
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Local Gifski and FFmpeg web interface",
-  "scripts": {"dev": "python3 server.py --preview --no-browser"}
+  "scripts": {
+    "dev": "python3 server.py --preview --no-browser"
+  }
 }

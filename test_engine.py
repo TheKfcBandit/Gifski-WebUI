@@ -60,6 +60,53 @@ class EngineTests(unittest.TestCase):
         job['status'] = 'completed'
         self.assertFalse(self.engine.has_active_jobs())
 
+    def test_thumbnail_input_selects_complete_result_without_copying_history(self):
+        job = self.process_job()
+        job.update(status='completed', bestIndex=0, results=[{'filename': 'sample.gif', 'sample': True},
+                                                          {'filename': 'full.gif'}, {'filename': 'best.gif'}])
+        snapshot = self.engine.thumbnail_input('process')
+        self.assertEqual(snapshot['index'], 1)
+        self.assertEqual(snapshot['path'], self.engine.outputs / 'process' / 'full.gif')
+        self.assertEqual(self.engine.list_job_summaries()[0]['thumbnailIndex'], 1)
+        self.assertNotIn('logs', snapshot)
+        job['bestIndex'] = 2
+        self.assertEqual(self.engine.thumbnail_input('process')['index'], 2)
+        job['status'] = 'running'
+        self.assertIsNone(self.engine.thumbnail_input('process'))
+        self.assertIsNone(self.engine.list_job_summaries()[0]['thumbnailIndex'])
+
+    def test_thumbnail_input_rejects_unsafe_paths_and_sample_only_results(self):
+        job = self.process_job()
+        job.update(status='completed', bestIndex=0)
+        for filename in ('../private.gif', r'..\private.gif', '/private.gif', 'file\x00.gif'):
+            job['results'] = [{'filename': filename}]
+            self.assertIsNone(self.engine.thumbnail_input('process'))
+        job['results'] = [{'filename': 'sample.gif', 'sample': True}]
+        self.assertIsNone(self.engine.thumbnail_input('process'))
+        self.assertIsNone(self.engine.thumbnail_input('../process'))
+
+    def test_terminal_estimate_thumbnail_uses_safe_source_and_trim_start(self):
+        job = self.process_job()
+        job.update(status='completed', mode='estimate', settings=copy.deepcopy(self.settings))
+        job['settings']['trim'] = {'start': 1.5, 'end': 5}
+        snapshot = self.engine.thumbnail_input('process')
+        self.assertEqual((snapshot['index'], snapshot['path'], snapshot['seek']), ('source', self.source, 1.5))
+        self.assertEqual(self.engine.list_job_summaries()[0]['thumbnailIndex'], 'source')
+        job['settings']['source']['kind'] = 'sequence'
+        self.assertEqual(self.engine.thumbnail_input('process')['seek'], 0)
+        self.source.unlink()
+        self.assertIsNone(self.engine.thumbnail_input('process'))
+
+    def test_source_thumbnail_rejects_network_paths_and_invalid_seek(self):
+        job = self.process_job()
+        job.update(status='completed', settings=copy.deepcopy(self.settings))
+        for path in ('https://example.com/video.mp4', r'\\server\video.mp4', '//server/video.mp4'):
+            job['settings']['source']['path'] = path
+            self.assertIsNone(self.engine.thumbnail_input('process'))
+        job['settings']['source']['path'] = str(self.source)
+        job['settings']['trim'] = {'start': float('nan')}
+        self.assertIsNone(self.engine.thumbnail_input('process'))
+
     def test_configuration_validation_is_atomic(self):
         previous = dict(self.engine.config)
         with self.assertRaises(ValueError):
@@ -72,7 +119,7 @@ class EngineTests(unittest.TestCase):
         local.parent.mkdir()
         local.write_bytes(b'fake')
         def run(command, **kwargs):
-            return subprocess.CompletedProcess(command, 1 if command[0] == 'broken' else 0, 'version 1', '')
+            return subprocess.CompletedProcess(command, 1 if command[0] == 'broken' else 0, Path(command[0]).stem + ' version 1', '')
         with patch('engine.shutil.which', side_effect=lambda name: '/system/' + name if name != 'broken' else None), patch('engine.subprocess.run', side_effect=run):
             self.assertEqual(self.engine.status()['tools']['ffmpeg']['path'], '/system/ffmpeg')
             self.assertEqual(self.engine._tool('ffmpeg'), '/system/ffmpeg')
@@ -82,7 +129,7 @@ class EngineTests(unittest.TestCase):
         self.engine.config = {}
         self.engine.invalidate_status()
         def broken_path(command, **kwargs):
-            return subprocess.CompletedProcess(command, 1 if command[0] == '/system/ffmpeg' else 0, 'version 2', '')
+            return subprocess.CompletedProcess(command, 1 if command[0] == '/system/ffmpeg' else 0, Path(command[0]).stem + ' version 2', '')
         with patch('engine.shutil.which', side_effect=lambda name: '/system/' + name), patch('engine.subprocess.run', side_effect=broken_path):
             self.assertEqual(self.engine.status()['tools']['ffmpeg']['path'], str(local))
             self.assertEqual(self.engine._tool('ffmpeg'), str(local))
@@ -94,7 +141,7 @@ class EngineTests(unittest.TestCase):
             calls.append(command)
             entered.set()
             release.wait(2)
-            return subprocess.CompletedProcess(command, 0, 'version 1', '')
+            return subprocess.CompletedProcess(command, 0, Path(command[0]).stem + ' version 1', '')
         with patch('engine.subprocess.run', side_effect=run):
             threads = [threading.Thread(target=lambda: results.append(self.engine.status())) for _ in range(2)]
             for thread in threads:
@@ -106,6 +153,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(len(calls), 4)  # Three versions and Gifski help, not two batches.
         self.assertEqual(results[0], results[1])
+
+    def test_tool_status_finds_identity_after_banner_and_on_stderr(self):
+        def run(command, **kwargs):
+            name = Path(command[0]).stem
+            return subprocess.CompletedProcess(command, 0, 'Package launcher banner', f'{name} version 9.2\nCopyright')
+        with patch('engine.subprocess.run', side_effect=run):
+            status = self.engine.status()
+        for name, item in status['tools'].items():
+            self.assertTrue(item['available'])
+            self.assertEqual(item['version'], f'{name} version 9.2')
+        self.assertEqual(self.engine._version_line('gifski', 'Launcher\ngifski 1.34.0\n'), 'gifski 1.34.0')
+
+    def test_tool_status_rejects_successful_unrelated_program(self):
+        with patch('engine.subprocess.run', return_value=subprocess.CompletedProcess([], 0, 'Python 3.14.0', '')):
+            status = self.engine.status()
+        for name, item in status['tools'].items():
+            self.assertFalse(item['available'])
+            self.assertEqual(item['version'], '')
+            self.assertIn(f'did not identify itself as {name}', item['error'])
 
     def test_ffmpeg_progress_is_structured_and_ignores_nonfinite_numbers(self):
         self.process_job()
@@ -121,7 +187,7 @@ class EngineTests(unittest.TestCase):
         def run(command, **kwargs):
             entered.set()
             release.wait(2)
-            return subprocess.CompletedProcess(command, 0, 'version 1', '')
+            return subprocess.CompletedProcess(command, 0, Path(command[0]).stem + ' version 1', '')
         with patch('engine.subprocess.run', side_effect=run):
             thread = threading.Thread(target=self.engine.status)
             thread.start()
@@ -485,6 +551,122 @@ class EngineTests(unittest.TestCase):
         for smart in ({'targetMB': float('nan')}, {'targetMB': float('inf')}, {'targetMB': 0}, {'effort': 'forever'}):
             with self.subTest(smart=smart), self.assertRaises(ValueError):
                 self.engine._normalize(dict(self.settings, smart=smart))
+
+    def test_smart_pin_validation_and_legacy_defaults(self):
+        settings = self.engine._normalize(self.settings)
+        self.assertFalse(settings['smart']['pinResolution'])
+        self.assertFalse(settings['smart']['pinFps'])
+        for values in ({'smart': {'pinResolution': 1}}, {'smart': {'pinFps': 'yes'}}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.engine._normalize(dict(self.settings, **values))
+        for values in ({'smart': {'pinResolution': True}, 'width': None, 'height': None},
+                       {'smart': {'pinFps': True}, 'fps': 60}):
+            for mode in ('smart', 'discord'):
+                with self.subTest(values=values, mode=mode), self.assertRaises(ValueError):
+                    self.engine.submit(dict(self.settings, **values), mode)
+        self.assertFalse(self.engine.jobs)
+
+    def test_advanced_plan_ignores_dormant_smart_pins(self):
+        settings = dict(self.settings, width=None, height=None, fps=60,
+                        smart={'pinResolution': True, 'pinFps': True})
+        plan = self.engine.plan(settings)
+        self.assertEqual(plan['settings']['fps'], 60)
+        self.assertIsNone(plan['settings']['width'])
+        self.assertTrue(any('GIF delays' in warning for warning in plan['warnings']))
+        with patch.object(self.engine, 'status', return_value={'tools': {'gifski': {'available': True}, 'ffmpeg': {'available': True}}}), \
+             patch.object(self.engine._queue, 'put'):
+            job = self.engine.submit(settings, 'encode')
+        self.assertEqual(job['status'], 'queued')
+
+    def test_smart_pinned_resolution_respects_crop_aspect_and_source_bounds(self):
+        source = {'width': 1000, 'height': 600, 'fps': 30}
+        settings = self.engine._normalize(dict(self.settings, width=None, height=300,
+                                                smart={'pinResolution': True, 'pinFps': True}, fps=12))
+        base, width, fps = self.engine._discord_settings(settings, source)
+        self.assertEqual((base['width'], base['height'], width, fps), (None, 300, 500, 12))
+        settings.update(width=2000, height=None)
+        base, width, _ = self.engine._discord_settings(settings, source)
+        self.assertEqual((base['width'], base['height'], width), (1000, None, 1000))
+        settings.update(width=200, crop={'enabled': True, 'x': 100, 'y': 50, 'width': 500, 'height': 300})
+        base, width, _ = self.engine._discord_settings(settings, source)
+        self.assertEqual((base['width'], base['height'], width), (200, None, 200))
+        settings.update(crop={'enabled': False}, width=6000, height=6000)
+        with self.assertRaisesRegex(ValueError, '16-megapixel'):
+            self.engine._discord_settings(settings, {'width': 6000, 'height': 6000, 'fps': 30})
+
+    def test_smart_sequence_pin_preserves_playback_rate_and_input_timing(self):
+        paths = []
+        for name in ('one.png', 'two.png'):
+            path = self.root / name
+            path.write_bytes(b'png')
+            paths.append(str(path))
+        settings = self.engine._normalize(dict(self.settings, source={'kind': 'sequence', 'paths': paths},
+            fps=12, speed=2, smart={'pinFps': True}))
+        base, _, fps = self.engine._discord_settings(settings, {'width': 320, 'height': 180})
+        self.assertEqual((base['fps'], base['_sequenceInputFps'], fps), (12, 12, 24))
+        settings['fps'] = 30
+        with self.assertRaisesRegex(ValueError, '50'):
+            self.engine._discord_settings(settings, {'width': 320, 'height': 180})
+
+    def test_smart_pins_survive_screening_search_and_quality_fallback(self):
+        for pin_resolution, pin_fps in ((True, False), (False, True), (True, True)):
+            for duration in (1, 30):
+                with self.subTest(pin_resolution=pin_resolution, pin_fps=pin_fps, duration=duration):
+                    settings = self.engine._normalize(dict(self.settings, width=400, height=240, fps=12,
+                        smart={'targetMB': .02, 'effort': 'thorough', 'pinResolution': pin_resolution, 'pinFps': pin_fps}))
+                    jid = f'pins-{pin_resolution}-{pin_fps}-{duration}'
+                    self.engine.jobs[jid] = {'results': [], 'mode': 'smart'}
+                    trials = []
+                    def size(trial):
+                        return max(1, round(1_000_000 * (trial['width'] / 1000) ** 2 * trial['fps'] / 30 * trial['quality'] / 100))
+                    def sample(jid, trial, metadata):
+                        trials.append(copy.deepcopy(trial))
+                        return {'estimatedBytes': size(trial)}
+                    def encode(jid, trial, index, total):
+                        trials.append(copy.deepcopy(trial))
+                        result = {'index': index, 'bytes': size(trial), 'settings': copy.deepcopy(trial)}
+                        self.engine.jobs[jid]['results'].append(result)
+                        return result
+                    with patch.object(self.engine, 'probe', return_value={'width': 1000, 'height': 600, 'fps': 30, 'duration': duration}), \
+                         patch.object(self.engine, '_sample_summary', side_effect=sample), patch.object(self.engine, '_encode', side_effect=encode):
+                        self.engine._discord(jid, settings)
+                    self.assertTrue(trials)
+                    if pin_resolution:
+                        self.assertTrue(all((trial['width'], trial['height']) == (400, 240) for trial in trials))
+                    else:
+                        self.assertEqual(trials[0]['width'], 1000)
+                        self.assertTrue(any(trial['width'] < 1000 for trial in trials))
+                        self.assertTrue(all(trial['height'] is None for trial in trials))
+                    if pin_fps:
+                        self.assertTrue(all(trial['fps'] == 12 for trial in trials))
+                    else:
+                        self.assertEqual(trials[0]['fps'], 30)
+                        self.assertTrue(any(trial['fps'] < 30 for trial in trials))
+                    results = self.engine.jobs[jid]['results']
+                    self.assertTrue(any(result['fit'] for result in results))
+                    if pin_resolution and pin_fps:
+                        self.assertTrue(any(result['settings']['quality'] < 40 for result in results))
+
+    def test_smart_pins_are_retained_for_extra_effort_and_truthful_no_fit(self):
+        settings = self.engine._normalize(dict(self.settings, width=400, height=240, fps=12,
+            smart={'targetMB': .001, 'effort': 'thorough', 'pinResolution': True, 'pinFps': True}))
+        for fits in (True, False):
+            jid = f'pinned-fit-{fits}'
+            self.engine.jobs[jid] = {'results': [], 'mode': 'smart'}
+            def encode(jid, trial, index, total):
+                self.assertEqual((trial['width'], trial['height'], trial['fps']), (400, 240, 12))
+                result = {'index': index, 'bytes': 900 if fits else 2000, 'settings': copy.deepcopy(trial)}
+                self.engine.jobs[jid]['results'].append(result)
+                return result
+            with patch.object(self.engine, 'probe', return_value={'width': 1000, 'height': 600, 'fps': 30, 'duration': 1}), \
+                 patch.object(self.engine, '_encode', side_effect=encode):
+                self.engine._discord(jid, settings)
+            job = self.engine.jobs[jid]
+            if fits:
+                self.assertTrue(any(result['settings']['effort'] == 'extra' for result in job['results']))
+            else:
+                self.assertTrue(all(not result['fit'] for result in job['results']))
+                self.assertIn('Pinned settings were preserved', job['searchNote'])
 
     def test_diminishing_quality_returns_preserve_detail(self):
         score = self.engine._fidelity_score

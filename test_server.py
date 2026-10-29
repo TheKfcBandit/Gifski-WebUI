@@ -130,9 +130,29 @@ class HTTPTests(unittest.TestCase):
             code, _, data = self.json_post('/api/dependencies/check-updates', {})
             self.assertEqual(code, 202)
             self.assertEqual(json.loads(data)['updates']['state'], 'checking')
-            check.assert_called_once_with({})
+            check.assert_called_once_with(refresh_installed=self.http.refresh_tools_snapshot)
             invalidate.assert_not_called()
         self.assertEqual(self.json_post('/api/dependencies/check-updates', {}, auth=False)[0], 401)
+
+    def test_version_refresh_callback_rechecks_the_selected_tools(self):
+        snapshot = {'ffmpeg': {'available': True, 'origin': 'path'}}
+        with patch.object(self.engine, 'status', return_value={'tools': snapshot}), patch.object(self.engine, 'invalidate_status') as invalidate:
+            self.assertEqual(self.http.refresh_tools_snapshot(), snapshot)
+            invalidate.assert_called_once_with()
+
+    def test_history_thumbnails_are_guarded_small_images(self):
+        thumbnail = self.root / 'thumbnail.jpg'
+        thumbnail.write_bytes(b'\xff\xd8\xff\xe0thumbnail\xff\xd9')
+        with patch.object(self.http.thumbnails, 'file_for', return_value=thumbnail) as resolve:
+            self.assertEqual(self.request('GET', '/api/jobs/testjob/thumbnail', auth=False)[0], 401)
+            resolve.assert_not_called()
+            code, headers, body = self.request('GET', '/api/jobs/testjob/thumbnail')
+            self.assertEqual(code, 200)
+            self.assertEqual(headers['Content-Type'], 'image/jpeg')
+            self.assertEqual(body, thumbnail.read_bytes())
+            resolve.assert_called_once_with('testjob')
+        with patch.object(self.http.thumbnails, 'file_for', side_effect=FileNotFoundError):
+            self.assertEqual(self.request('GET', '/api/jobs/missing/thumbnail')[0], 404)
 
     def test_explicit_installed_version_refresh_invalidates_status(self):
         with patch.object(self.http, 'invalidate_tools') as invalidate:

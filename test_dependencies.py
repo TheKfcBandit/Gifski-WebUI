@@ -9,6 +9,7 @@ import struct
 import tarfile
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -175,7 +176,7 @@ class DependencyTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     manager._latest_release('gifski')
 
-    def test_version_states_do_not_claim_custom_builds_are_current(self):
+    def test_version_states_compare_stable_vendor_bases_but_not_snapshots(self):
         manager = dep.DependencyManager(self.root)
         manager.release_cache = {'gifski': '1.34.0', 'ffmpeg': '8.0.1'}
         manager.check_state = 'completed'
@@ -183,9 +184,16 @@ class DependencyTests(unittest.TestCase):
                  ('ffmpeg version 7.1.1', 'update_available'),
                  ('ffmpeg version 7.1.1-essentials_build-www.gyan.dev', 'update_available'),
                  ('ffmpeg version 9.0.0', 'newer'),
-                 ('ffmpeg version 8.0.1-essentials_build-www.gyan.dev', 'unknown'),
+                 ('ffmpeg version 8.0.1-essentials_build-www.gyan.dev', 'current'),
+                 ('ffmpeg version n8.0.1-20251001', 'current'),
+                 ('ffmpeg version n7.1.1-20251001', 'update_available'),
+                 ('ffmpeg version 8.0.1-full_build-www.gyan.dev', 'current'),
+                 ('ffmpeg version 8.0.1-0+deb12u1', 'current'),
                  ('ffmpeg version 8.0.1-12-gabc123', 'unknown'),
+                 ('ffmpeg version n8.0.1-12-gabc123-20251001', 'unknown'),
                  ('ffmpeg version N-119000-gabc123', 'unknown'),
+                 ('ffmpeg version 2026-10-25-git-46f23be8b1-full_build-www.gyan.dev', 'unknown'),
+                 ('ffmpeg version n8.1-dev-20251001', 'unknown'),
                  ('ffmpeg version 8.0.1-rc1', 'unknown')]
         for value, expected in cases:
             with self.subTest(value=value):
@@ -348,6 +356,110 @@ class DependencyTests(unittest.TestCase):
         for version, expected in [('1.33.0', 'update_available'), ('1.34.0', 'current')]:
             state = manager.status({'gifski': {'available': True, 'version': 'gifski ' + version}})
             self.assertEqual(state['updates']['tools']['gifski']['state'], expected)
+
+    def test_build_diagnostics_recognize_vendor_tags_and_do_not_order_nightlies(self):
+        cases = [
+            ('ffmpeg', 'ffmpeg version n9.0.2-20261025', 'vendor', '9.0.2', (9, 0, 2)),
+            ('ffprobe', 'ffprobe version 9.0.2-essentials_build-www.gyan.dev', 'vendor', '9.0.2', (9, 0, 2)),
+            ('ffmpeg', 'ffmpeg version n9.0.2-35-g9a9b70bb8c-20261025', 'snapshot', '9.0.2', None),
+            ('ffmpeg', 'ffmpeg version N-128094-g31855b2a70-20261025', 'snapshot', '', None),
+            ('ffmpeg', 'ffmpeg version 2026-10-25-git-46f23be8b1-full_build-www.gyan.dev', 'snapshot', '', None),
+            ('ffmpeg', 'ffmpeg version n9.1-dev-20261025', 'snapshot', '9.1', None),
+            ('ffmpeg', 'ffmpeg version 9.0-rc2', 'prerelease', '9.0', None),
+            ('ffmpeg', 'Wrapper startup message\nffmpeg version 9.0.2', 'stable', '9.0.2', (9, 0, 2)),
+            ('gifski', 'gifski 1.34.0', 'stable', '1.34.0', (1, 34, 0)),
+            ('ffmpeg', 'unrecognized executable output', 'unknown', '', None),
+        ]
+        for name, banner, kind, base, comparable in cases:
+            with self.subTest(banner=banner):
+                build = dep.installed_build(name, banner)
+                self.assertEqual((build['kind'], build['baseVersion'], build['comparable']), (kind, base, comparable))
+
+    def test_active_path_version_is_compared_instead_of_unused_portable_copy(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        (self.root / 'bin').mkdir()
+        for name in ('ffmpeg', 'ffprobe'):
+            (self.root / 'bin' / (name + '.exe')).write_bytes(executable())
+        manager.release_cache = {'ffmpeg': '9.0.2'}
+        manager.check_state = 'completed'
+        installed = {name: {'available': True, 'origin': 'path', 'path': '/system/' + name,
+                            'version': name + ' version 8.1.2-essentials_build-www.gyan.dev'}
+                     for name in ('ffmpeg', 'ffprobe')}
+        status = manager.status(installed)
+        active = status['updates']['tools']['ffmpeg']
+        self.assertEqual(active['state'], 'update_available')
+        self.assertEqual(active['installedOrigin'], 'path')
+        self.assertEqual(active['installedPath'], '/system/ffmpeg')
+        self.assertEqual(active['installedBaseVersion'], '8.1.2')
+        self.assertEqual(active['updateMethod'], 'external')
+        self.assertIn('PATH', active['updateHint'])
+        self.assertTrue(status['tools']['ffmpeg']['installed'])
+        self.assertFalse(status['tools']['ffmpeg']['portableUpdateAffectsActive'])
+        for name in installed:
+            installed[name].update(origin='configured', path=str(self.root / 'bin' / (name + '.exe')),
+                                   version=name + ' version 9.0.2-essentials_build-www.gyan.dev')
+        status = manager.status(installed)
+        active = status['updates']['tools']['ffmpeg']
+        self.assertEqual(active['state'], 'current')
+        self.assertEqual(active['installedKind'], 'vendor')
+        self.assertEqual(active['updateMethod'], 'portable')
+        self.assertIn('Vendor rebuilds', active['message'])
+        self.assertTrue(status['tools']['ffmpeg']['portableUpdateAffectsActive'])
+
+    def test_manual_check_refreshes_active_version_asynchronously_even_with_cached_upstream(self):
+        manager = dep.DependencyManager(self.root)
+        manager.release_cache = {'ffmpeg': '9.0.2', 'gifski': '1.34.0'}
+        manager.check_state = 'completed'
+        manager.checked_monotonic = time.monotonic()
+        manager.checked_at = 1234
+        manager.status({'ffmpeg': {'available': True, 'origin': 'path', 'version': 'ffmpeg version 8.0.1'}})
+        entered, release = threading.Event(), threading.Event()
+        def refresh():
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError('Test release was not signaled.')
+            return {'ffmpeg': {'available': True, 'origin': 'path', 'version': 'ffmpeg version 9.0.2-full_build-www.gyan.dev'}}
+        with patch.object(manager, '_latest_release') as latest:
+            try:
+                status = manager.check_updates(refresh_installed=refresh)
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(status['updates']['state'], 'checking')
+                self.assertEqual(status['updates']['phase'], 'installed')
+                self.assertIn('Refreshing', status['updates']['tools']['ffmpeg']['message'])
+                with patch.object(dep.threading, 'Thread') as thread:
+                    manager.check_updates(refresh_installed=lambda: self.fail('Duplicate refresh'))
+                    thread.assert_not_called()
+            finally:
+                release.set()
+                for worker in threading.enumerate():
+                    if worker.name == 'check-updates':
+                        worker.join(2)
+            latest.assert_not_called()
+        final = manager.status()['updates']
+        self.assertEqual(final['state'], 'completed')
+        self.assertEqual(final['phase'], '')
+        self.assertTrue(final['cached'])
+        self.assertEqual(final['checkedAt'], 1234)
+        self.assertEqual(final['tools']['ffmpeg']['state'], 'current')
+
+    def test_local_refresh_failure_finishes_with_sanitized_diagnostic(self):
+        manager = dep.DependencyManager(self.root)
+        with patch.object(dep.threading, 'Thread'):
+            manager.check_updates(refresh_installed=lambda: {})
+        def fail():
+            raise RuntimeError('secret-user-path-or-token')
+        manager._check_worker(fail)
+        state = manager.status()['updates']
+        self.assertEqual(state['state'], 'failed')
+        self.assertEqual(state['phase'], '')
+        self.assertFalse(manager.check_pending)
+        self.assertEqual(state['tools']['ffmpeg']['errorCode'], 'local_detection')
+        self.assertIn('Restart', state['tools']['ffmpeg']['message'])
+        self.assertNotIn('secret', json.dumps(state))
+        with patch.object(manager, '_latest_release', side_effect=lambda name: {'gifski': '1.34.0', 'ffmpeg': '9.0.2'}[name]):
+            manager._check_worker(lambda: {'ffmpeg': {'available': True, 'origin': 'path', 'version': 'ffmpeg version 9.0.2'}})
+        self.assertEqual(manager.status()['updates']['tools']['ffmpeg']['state'], 'current')
+        self.assertEqual(manager.status()['updates']['state'], 'completed')
 
     def test_metadata_size_limit(self):
         with patch.object(dep, '_open', return_value=io.BytesIO(b'123456')):

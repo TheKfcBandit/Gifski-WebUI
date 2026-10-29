@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from engine import Engine
 from dependencies import DependencyManager
+from thumbnails import ThumbnailCache
 
 ROOT = Path(__file__).resolve().parent
 MAX_JSON = 2 * 1024 * 1024
@@ -39,10 +40,22 @@ class Server(ThreadingHTTPServer):
         self.sources = set()
         self.source_lock = threading.Lock()
         self.operation_lock = threading.RLock()
+        self.thumbnails = ThumbnailCache(engine, self.operation_lock,
+                                         can_generate=lambda: not self.dependencies.status()['busy'])
 
 
     def invalidate_tools(self):
         self.engine.invalidate_status()
+
+    def refresh_tools_snapshot(self):
+        with self.operation_lock:
+            self.invalidate_tools()
+            return self.engine.status().get('tools', {})
+
+    def server_close(self):
+        if hasattr(self, 'thumbnails'):
+            self.thumbnails.close()
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -261,7 +274,16 @@ class Handler(BaseHTTPRequestHandler):
             if route == '/api/jobs':
                 summaries = urllib.parse.parse_qs(parsed.query).get('summary') == ['1']
                 jobs = self.server.engine.list_job_summaries() if summaries else self.server.engine.list_jobs()
+                if summaries:
+                    jobs = self.server.thumbnails.decorate(jobs)
                 return self.send_json({'jobs': jobs})
+            match = re.fullmatch(r'/api/jobs/([A-Za-z0-9_-]+)/thumbnail', route)
+            if match:
+                try:
+                    thumbnail = self.server.thumbnails.file_for(match[1])
+                except (ValueError, KeyError, FileNotFoundError):
+                    return self.send_json({'error': 'Thumbnail is not available.'}, 404)
+                return self.send_file(thumbnail)
             match = re.fullmatch(r'/api/jobs/([A-Za-z0-9_-]+)', route)
             if match:
                 job = self.server.engine.get_job(match[1])
@@ -333,7 +355,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.invalidate_tools()
                 return self.send_json(self.server.engine.status())
             if route == '/api/dependencies/check-updates':
-                return self.send_json(self.server.dependencies.check_updates(self.server.engine.status().get('tools', {})), 202)
+                return self.send_json(self.server.dependencies.check_updates(refresh_installed=self.server.refresh_tools_snapshot), 202)
             if route == '/api/dependencies/install-missing':
                 with self.server.operation_lock:
                     if self.server.engine.has_active_jobs():

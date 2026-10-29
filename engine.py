@@ -34,7 +34,7 @@ DEFAULTS = {
     'customFilter': '', 'pipeline': 'auto',
     'performance': {'threads': 0, 'hardwareDecode': 'none'},
     'sweep': {'qualities': [70, 80, 90], 'widths': [480, 640], 'fps': [15, 20]},
-    'smart': {'targetMB': 20, 'effort': 'balanced'},
+    'smart': {'targetMB': 20, 'effort': 'balanced', 'pinResolution': False, 'pinFps': False},
     'optimize': {'targetMiB': 8, 'minQuality': 40, 'maxQuality': 95,
                  'minWidth': 320, 'minFps': 10, 'allowResize': True,
                  'allowFps': True, 'maxTrials': 18},
@@ -151,6 +151,13 @@ class Engine:
         with self.lock:
             return self._resolved_tools.get(name) or self._tool_candidates(name, self.config)[0]
 
+    @staticmethod
+    def _version_line(name, output):
+        pattern = (r'^\s*gifski(?:\s+version)?\s+\d[^\r\n]*' if name == 'gifski'
+                   else rf'^\s*{re.escape(name)}\s+version\s+\S+[^\r\n]*')
+        match = re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
+        return match.group(0).strip()[:1000] if match else ''
+
     def status(self):
         # One probe batch at a time. The jobs lock remains free while programs run.
         with self.lock:
@@ -169,10 +176,11 @@ class Engine:
                     item = {'path': path, 'origin': origin, 'available': False, 'version': '', 'help': ''}
                     try:
                         r = subprocess.run([path, '--version' if name == 'gifski' else '-version'], capture_output=True, text=True, errors='replace', timeout=5)
-                        combined = (r.stdout + r.stderr).strip()
-                        item.update(available=r.returncode == 0, version=combined.splitlines()[0][:1000] if combined else '')
+                        combined = (r.stdout + '\n' + r.stderr).strip()
+                        version = self._version_line(name, combined)
+                        item.update(available=r.returncode == 0 and bool(version), version=version)
                         if not item['available']:
-                            item['error'] = combined[-1000:] or f'Exited with code {r.returncode}.'
+                            item['error'] = (combined[-1000:] or f'Exited with code {r.returncode}.') if r.returncode else f'Program did not identify itself as {name}.'
                             continue
                         if name == 'gifski':
                             try:
@@ -328,6 +336,9 @@ class Engine:
         s['smart']['targetMB'] = number(s['smart']['targetMB'], 'Target MB', .001, 100000)
         if s['smart']['effort'] not in ('quick', 'balanced', 'thorough'):
             raise ValueError('Unknown search effort.')
+        for pin in ('pinResolution', 'pinFps'):
+            if not isinstance(s['smart'][pin], bool):
+                raise ValueError(f'{pin} must be true or false.')
         for k in ('quality', 'lossyQuality', 'motionQuality'):
             s[k] = number(s[k], k, 1, 100, integer=True, nullable=k != 'quality')
         for k in ('width', 'height'):
@@ -511,6 +522,7 @@ class Engine:
         plan = self.plan(settings)
         s = plan['settings']
         if mode in ('smart', 'discord'):
+            self._validate_smart_pins(s)
             managed_warnings = ('Gifski applies its default automatic size limit',
                                 'Explicit width and height', 'GIF delays', 'Extra effort')
             plan['warnings'] = [warning for warning in plan['warnings'] if not warning.startswith(managed_warnings)]
@@ -544,6 +556,69 @@ class Engine:
         with self.lock:
             return copy.deepcopy(sorted(self.jobs.values(), key=lambda j: j['created'], reverse=True))
 
+    @staticmethod
+    def _thumbnail_source(job):
+        source = job.get('settings', {}).get('source', {})
+        metadata = job.get('sourceMetadata', {})
+        raw = metadata.get('path') or next(iter(source.get('paths') or []), '') or source.get('path')
+        if (not isinstance(raw, str) or not raw or len(raw) > 4096 or '\x00' in raw or
+                raw.startswith(('//', '\\\\')) or re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', raw)):
+            return None
+        seek = job.get('settings', {}).get('trim', {}).get('start', 0)
+        if source.get('kind') == 'sequence' or Path(raw).suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tiff'):
+            seek = 0
+        if isinstance(seek, bool) or not isinstance(seek, (int, float)) or not math.isfinite(seek) or not 0 <= seek <= 8640000:
+            return None
+        return raw, seek
+
+    @staticmethod
+    def _thumbnail_index(job):
+        if job.get('status') not in ('completed', 'cancelled', 'failed', 'interrupted'):
+            return None
+        results = job.get('results', [])
+        valid = []
+        for index, result in enumerate(results):
+            if not isinstance(result, dict) or result.get('sample'):
+                continue
+            filename = result.get('filename')
+            if (isinstance(filename, str) and filename.lower().endswith('.gif') and
+                    not any(char in filename for char in ('/', '\\', '\x00'))):
+                valid.append(index)
+        chosen = job.get('bestIndex')
+        if isinstance(chosen, int) and not isinstance(chosen, bool) and chosen in valid:
+            return chosen
+        return valid[0] if valid else 'source' if Engine._thumbnail_source(job) else None
+
+    def thumbnail_input(self, jid):
+        """A narrow snapshot of a terminal job's result, or its local source."""
+        if not isinstance(jid, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', jid):
+            return None
+        with self.lock:
+            job = self.jobs.get(jid)
+            index = self._thumbnail_index(job) if job else None
+            if index is None:
+                return None
+            status = job['status']
+            if index == 'source':
+                source = self._thumbnail_source(job)
+            else:
+                source = None
+                filename = job['results'][index]['filename']
+        if source is not None:
+            try:
+                path = self._paths({'kind': 'video', 'path': source[0]})[0]
+            except (ValueError, OSError):
+                return None
+            return {'id': jid, 'status': status, 'index': 'source', 'path': path, 'seek': source[1]}
+        if index != 'source':
+            root = self.outputs.resolve()
+            directory = (root / jid).resolve()
+            path = (directory / filename).resolve()
+            if directory != root / jid or path.parent != directory:
+                return None
+            return {'id': jid, 'status': status, 'index': index, 'path': path, 'seek': 0}
+        return None
+
     def list_job_summaries(self):
         with self.lock:
             summaries = []
@@ -552,7 +627,8 @@ class Engine:
                                                      'stage', 'progress', 'bestIndex', 'error')}
                 source = job.get('settings', {}).get('source', {})
                 name = source.get('path') or next(iter(source.get('paths') or []), '')
-                item.update(sourceName=re.split(r'[/\\]', name)[-1], resultCount=len(job.get('results', [])))
+                item.update(sourceName=re.split(r'[/\\]', name)[-1], resultCount=len(job.get('results', [])),
+                            thumbnailIndex=self._thumbnail_index(job))
                 summaries.append(item)
             return summaries
 
@@ -1224,7 +1300,8 @@ class Engine:
             job['searchNote'] = estimate['note']
 
     def _discord_settings(self, s, metadata):
-        """Source-quality baseline, aspect preserved and never enlarged."""
+        """Automatic source baseline or fixed requested axes, without upscaling."""
+        self._validate_smart_pins(s)
         trial = copy.deepcopy(s)
         width = number(metadata.get('width'), 'Source width', 1, 65535, integer=True)
         height = number(metadata.get('height'), 'Source height', 1, 65535, integer=True)
@@ -1235,8 +1312,18 @@ class Engine:
             raise ValueError('Crop lies outside the source.')
         # Source-sized output is allowed; the cap is a resource safety bound,
         # not an arbitrary export preset resolution.
-        scale = min(1.0, math.sqrt(16_000_000 / (width * height)))
-        base_width = max(1, int(width * scale))
+        if s['smart']['pinResolution']:
+            pinned_width = min(width, s['width']) if s['width'] is not None else None
+            pinned_height = min(height, s['height']) if s['height'] is not None else None
+            actual_width = pinned_width or max(1, round(width * pinned_height / height))
+            actual_height = pinned_height or max(1, round(height * pinned_width / width))
+            if actual_width * actual_height > 16_000_000:
+                raise ValueError('Pinned resolution exceeds the 16-megapixel Smart limit. Choose smaller dimensions or use Advanced export.')
+            base_width = actual_width
+        else:
+            scale = min(1.0, math.sqrt(16_000_000 / (width * height)))
+            base_width = max(1, int(width * scale))
+            pinned_width, pinned_height = base_width, None
         if s['source']['kind'] == 'sequence':
             input_rate = s.get('_sequenceInputFps', s['fps'])
             source_rate = input_rate * s['speed']
@@ -1245,10 +1332,20 @@ class Engine:
             source_rate = float(metadata.get('fps') or s['fps']) * s['speed']
         if not math.isfinite(source_rate) or source_rate <= 0:
             source_rate = s['fps']
-        base_fps = max(.001, min(50, source_rate))
-        trial.update(width=base_width, height=None, quality=100, motionQuality=None,
+        base_fps = ((s['fps'] * s['speed'] if s['source']['kind'] == 'sequence' else s['fps'])
+                    if s['smart']['pinFps'] else max(.001, min(50, source_rate)))
+        trial.update(width=pinned_width, height=pinned_height, quality=100, motionQuality=None,
                      lossyQuality=None, effort='normal', pipeline='png')
         return trial, base_width, base_fps
+
+    @staticmethod
+    def _validate_smart_pins(s):
+        if s['smart']['pinResolution'] and s['width'] is None and s['height'] is None:
+            raise ValueError('Pinning resolution requires a width or height.')
+        if s['smart']['pinFps']:
+            effective_fps = s['fps'] * s['speed'] if s['source']['kind'] == 'sequence' else s['fps']
+            if effective_fps > 50:
+                raise ValueError('Pinned playback FPS must not exceed 50; GIF frame delays cannot preserve a higher rate reliably.')
 
     @staticmethod
     def _fidelity_score(width, fps, quality, base_width, base_fps):
@@ -1268,12 +1365,18 @@ class Engine:
         if not metadata.get('duration') and s['trim']['end'] is not None:
             metadata['duration'] = s['trim']['end']
         base, base_width, base_fps = self._discord_settings(s, metadata)
+        pin_resolution, pin_fps = s['smart']['pinResolution'], s['smart']['pinFps']
         sample_budget, full_budget = {'quick': (5, 4), 'balanced': (9, 8), 'thorough': (15, 12)}[s['smart']['effort']]
         with self.lock:
             job['targetBytes'] = target
             job['search'] = {'sampleTrials': 0, 'fullTrials': 0, 'cacheHits': 0,
-                             'frameCacheHits': 0, 'phase': 'screening', 'reason': ''}
-            if metadata['width'] * metadata['height'] > 16_000_000 and not s['crop']['enabled']:
+                             'frameCacheHits': 0, 'phase': 'screening', 'reason': '',
+                             'pinResolution': pin_resolution, 'pinFps': pin_fps}
+            if pin_resolution and (base['width'] != s['width'] or base['height'] != s['height']):
+                job.setdefault('warnings', []).append('Pinned dimensions are limited to the cropped source bounds; Smart never upscales.')
+            if pin_resolution and base['width'] and base['height']:
+                job.setdefault('warnings', []).append('Both dimensions are pinned independently. Leave one blank to preserve the source aspect ratio.')
+            if not pin_resolution and metadata['width'] * metadata['height'] > 16_000_000 and not s['crop']['enabled']:
                 job.setdefault('warnings', []).append('Adaptive exports limit each frame to 16 megapixels for memory safety.')
         try:
             a, b = self._source_interval(base, metadata)
@@ -1290,7 +1393,9 @@ class Engine:
         def recipe(key):
             width, fps, quality = key
             trial = copy.deepcopy(base)
-            trial.update(width=width, fps=fps / s['speed'] if s['source']['kind'] == 'sequence' else fps, quality=quality)
+            trial.update(fps=s['fps'] if pin_fps else fps / s['speed'] if s['source']['kind'] == 'sequence' else fps, quality=quality)
+            if not pin_resolution:
+                trial['width'] = width
             return trial
 
         def score(key):
@@ -1356,7 +1461,7 @@ class Engine:
                 best = verify(top)
                 if best['fit']:
                     extra_if_requested(top)
-                    self._finish_smart(jid, target, 'Source dimensions, source frame rate (up to 50 FPS), and quality 100 fit within the budget.')
+                    self._finish_smart(jid, target, 'Quality 100 fits within the selected resolution and frame-rate constraints.')
                     return
                 model['correction'] = max(.1, best['bytes'] / reference)
             # Isolated probes learn the actual clip's quality, pixel and motion
@@ -1367,7 +1472,7 @@ class Engine:
             for key, axis, ratio, bounds in zip(probes, ('quality', 'width', 'fps'),
                                                 (.85, probes[1][0] / base_width, probes[2][1] / base_fps),
                                                 ((.2, 4), (.5, 3.5), (.1, 1.5))):
-                if key == top or ratio >= 1:
+                if key == top or ratio >= 1 or (axis == 'width' and pin_resolution) or (axis == 'fps' and pin_fps):
                     continue
                 value = screen(key)
                 exponent = math.log(max(.001, value / reference)) / math.log(ratio)
@@ -1377,14 +1482,19 @@ class Engine:
             reference = max(1, first['bytes'])
             if first['fit']:
                 extra_if_requested(top)
-                self._finish_smart(jid, target, 'The source-sized quality-100 export fits within the budget.')
+                self._finish_smart(jid, target, 'Quality 100 fits within the selected resolution and frame-rate constraints.')
                 return
 
         # Pixel and FPS candidates are paired with quality choices. Search
         # follows measured response, not a Cartesian series of full encodes.
-        widths = list(dict.fromkeys(max(1, round(base_width * x)) for x in (1, .93, .85, .75, .65, .55, .45, .35, .25, .16, .10, .05)))
-        rates = list(dict.fromkeys(max(min(5, base_fps), round(base_fps * x, 3)) for x in (1, .85, .70, .55, .4)))
-        candidates = list(itertools.product(widths, rates, (100, 95, 90, 85, 80, 70, 60, 50, 40)))
+        widths = [base_width] if pin_resolution else list(dict.fromkeys(max(1, round(base_width * x)) for x in (1, .93, .85, .75, .65, .55, .45, .35, .25, .16, .10, .05)))
+        rates = [base_fps] if pin_fps else list(dict.fromkeys(max(min(5, base_fps), round(base_fps * x, 3)) for x in (1, .85, .70, .55, .4)))
+        qualities = (100, 95, 90, 85, 80, 70, 60, 50, 40)
+        if pin_resolution or pin_fps:
+            # Pins remove size controls. Include the full lower quality range
+            # before reporting no fit, rather than breaking a fixed setting.
+            qualities += (30, 20, 10, 1)
+        candidates = list(itertools.product(widths, rates, qualities))
         if can_sample:
             while len(screened) < sample_budget:
                 remaining = [k for k in candidates if k not in screened and k not in verified]
@@ -1428,7 +1538,7 @@ class Engine:
             # so one unusual scene does not abruptly discard every candidate.
             model['correction'] *= max(.35, min(3.0, ratio))
             if result['fit'] and key == top:
-                reason = 'Maximum source-quality settings fit.'
+                reason = 'Maximum quality within the selected constraints fits.'
                 break
         if len(job['results']) < full_budget:
             fits = [key for key, result in verified.items() if result['fit']]
@@ -1449,8 +1559,10 @@ class Engine:
                                      'This is a settings preference model, not a perceptual metric or a guarantee of a global optimum.')
             elif results:
                 job['bestIndex'] = min(results, key=lambda r: r['bytes'])['index']
+                pins = job['search'].get('pinResolution') or job['search'].get('pinFps')
                 job['searchNote'] = (f'No tested candidate fits {target:,} bytes. The smallest measured result is shown without a fit claim. '
-                                     'Shorten the clip or increase the limit.')
+                                     + ('Pinned settings were preserved. Relax a pin, shorten the clip or increase the limit.' if pins else
+                                        'Shorten the clip or increase the limit.'))
             job['search']['reason'] = reason
             job['search']['phase'] = 'complete'
 
