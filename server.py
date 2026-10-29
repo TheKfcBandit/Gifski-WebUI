@@ -54,6 +54,33 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(60)
 
+    def handle_one_request(self):
+        self._response_started = False
+        try:
+            super().handle_one_request()
+        except (ConnectionError, TimeoutError):
+            # Browsers cancel media requests when seeking or changing source.
+            # Windows reports some cancellations as ConnectionAbortedError.
+            self.close_connection = True
+
+    def send_response_only(self, code, message=None):
+        self._response_status = code
+        super().send_response_only(code, message)
+
+    def end_headers(self):
+        # Mark before writing: even a partial header write starts the response.
+        # An interim 100 Continue still permits a later final error response.
+        if self._response_status >= 200:
+            self._response_started = True
+        super().end_headers()
+
+    def request_error(self, error, code):
+        if self._response_started:
+            # A streamed response cannot be replaced with a second HTTP reply.
+            self.close_connection = True
+            return
+        self.send_json({'error': str(error)}, code)
+
     def log_message(self, fmt, *args):
         # Avoid noisy polling and leaking complete local paths into terminal logs.
         # Query strings can contain private local paths. Keep request logs off.
@@ -255,12 +282,12 @@ class Handler(BaseHTTPRequestHandler):
             if route == '/api/features':
                 return self.send_json({'text': (ROOT / 'FEATURES.md').read_text('utf-8')})
             return self.send_json({'error': 'Not found.'}, 404)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (ConnectionError, TimeoutError):
+            self.close_connection = True
         except (ValueError, KeyError, IndexError, FileNotFoundError) as e:
-            self.send_json({'error': str(e)}, 400)
+            self.request_error(e, 400)
         except Exception as e:
-            self.send_json({'error': str(e)}, 500)
+            self.request_error(e, 500)
 
     def do_POST(self):
         if not self.guard(mutate=True):
@@ -340,14 +367,13 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 return self.send_json(self.server.engine.cancel(match[1]))
             return self.send_json({'error': 'Not found.'}, 404)
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        except (ConnectionError, TimeoutError):
             self.close_connection = True
-            pass
         except (ValueError, KeyError, IndexError, FileNotFoundError, json.JSONDecodeError) as e:
             self.close_connection = True
-            self.send_json({'error': str(e)}, 400)
+            self.request_error(e, 400)
         except Exception as e:
-            self.send_json({'error': str(e)}, 500)
+            self.request_error(e, 500)
 
 
 def main():

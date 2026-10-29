@@ -1,5 +1,6 @@
 """HTTP contract tests, isolated from the user's media and installed executables."""
 import http.client
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -10,6 +11,28 @@ from unittest.mock import patch
 from urllib.parse import quote
 
 import server
+
+
+class FaultSocket:
+    """Exercise the real handler with deterministic socket-write failures."""
+    def __init__(self, request, fail_at=None, error=None):
+        self.incoming = io.BytesIO(request)
+        self.fail_at = fail_at
+        self.error = error
+        self.attempts = 0
+        self.sent = []
+
+    def makefile(self, *args):
+        return self.incoming
+
+    def settimeout(self, value):
+        pass
+
+    def sendall(self, data):
+        self.attempts += 1
+        if self.attempts == self.fail_at:
+            raise self.error
+        self.sent.append(bytes(data))
 
 
 class FakeEngine:
@@ -132,6 +155,70 @@ class HTTPTests(unittest.TestCase):
     def json_post(self, path, value, **kwargs):
         headers = {'Content-Type': 'application/json', **kwargs.pop('headers', {})}
         return self.request('POST', path, json.dumps(value), headers=headers, **kwargs)
+
+    def simulate_request(self, requests, fail_at=None, error=None):
+        connection = FaultSocket(requests.encode(), fail_at, error)
+        handler = server.Handler(connection, ('127.0.0.1', 12345), self.http)
+        return handler, connection
+
+    def test_media_disconnect_never_attempts_a_second_response(self):
+        request = f'GET /api/files/testjob/0 HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\nConnection: close\r\n\r\n'
+        for error_type in (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, TimeoutError):
+            for fail_at in (1, 2):
+                with self.subTest(error=error_type.__name__, phase='headers' if fail_at == 1 else 'body'):
+                    handler, connection = self.simulate_request(request, fail_at, error_type(10053, 'Connection aborted'))
+                    self.assertTrue(handler.close_connection)
+                    self.assertEqual(connection.attempts, fail_at)
+                    self.assertNotIn(b'500 Internal Server Error', b''.join(connection.sent))
+
+    def test_disconnect_while_sending_post_guard_or_parser_error(self):
+        for request in (
+            f'POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nContent-Length: 2\r\n\r\n{{}}',
+            f'PATCH /api/config HTTP/1.1\r\nHost: {self.host}\r\n\r\n',
+        ):
+            handler, connection = self.simulate_request(request, 1, ConnectionAbortedError(10053, 'Connection aborted'))
+            self.assertTrue(handler.close_connection)
+            self.assertEqual(connection.attempts, 1)
+
+    def test_disconnect_while_sending_fallback_error_is_quiet(self):
+        request = f'GET /api/status HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\nConnection: close\r\n\r\n'
+        with patch.object(self.engine, 'status', side_effect=RuntimeError('Engine unavailable')):
+            handler, connection = self.simulate_request(request, 1, ConnectionAbortedError(10053, 'Connection aborted'))
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(connection.attempts, 1)
+        with patch.object(self.engine, 'status', side_effect=RuntimeError('Engine unavailable')):
+            _, connection = self.simulate_request(request)
+        self.assertIn(b'500 Internal Server Error', b''.join(connection.sent))
+        self.assertIn(b'Engine unavailable', b''.join(connection.sent))
+
+    def test_midstream_file_error_closes_without_appending_json(self):
+        request = f'GET /api/files/testjob/0 HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\nConnection: close\r\n\r\n'
+        with patch.object(Path, 'open', side_effect=OSError('Read failure')):
+            handler, connection = self.simulate_request(request)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(connection.attempts, 1)
+        self.assertIn(b'200 OK', connection.sent[0])
+        self.assertNotIn(b'500 Internal Server Error', connection.sent[0])
+
+    def test_keep_alive_resets_response_state_before_next_error(self):
+        request = (f'GET /api/status HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\n\r\n'
+                   f'POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\n'
+                   'Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]')
+        _, connection = self.simulate_request(request)
+        sent = b''.join(connection.sent)
+        self.assertEqual(sent.count(b'HTTP/1.1'), 2)
+        self.assertIn(b'200 OK', sent)
+        self.assertIn(b'400 Bad Request', sent)
+
+    def test_interim_continue_does_not_block_final_error_response(self):
+        request = (f'POST /api/config HTTP/1.1\r\nHost: {self.host}\r\nCookie: {self.cookie}\r\n'
+                   'Expect: 100-continue\r\nContent-Type: application/json\r\n'
+                   'Content-Length: 2\r\nConnection: close\r\n\r\n[]')
+        _, connection = self.simulate_request(request)
+        sent = b''.join(connection.sent)
+        self.assertEqual(sent.count(b'HTTP/1.1'), 2)
+        self.assertIn(b'100 Continue', sent)
+        self.assertIn(b'400 Bad Request', sent)
 
     def test_page_sets_browser_session_and_security_headers(self):
         status, headers, body = self.request('GET', '/', auth=False)
