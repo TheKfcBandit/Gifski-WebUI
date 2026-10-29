@@ -5,6 +5,8 @@ Python 3.10+, standard library only. Child programs never run through a shell.
 from __future__ import annotations
 
 import copy
+import codecs
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import itertools
 import json
@@ -30,6 +32,7 @@ DEFAULTS = {
     'crop': {'enabled': False, 'x': 0, 'y': 0, 'width': 640, 'height': 360},
     'scaleFilter': 'lanczos', 'denoise': 0, 'sharpen': 0, 'reverse': False,
     'customFilter': '', 'pipeline': 'auto',
+    'performance': {'threads': 0, 'hardwareDecode': 'none'},
     'sweep': {'qualities': [70, 80, 90], 'widths': [480, 640], 'fps': [15, 20]},
     'smart': {'targetMB': 20, 'effort': 'balanced'},
     'optimize': {'targetMiB': 8, 'minQuality': 40, 'maxQuality': 95,
@@ -103,6 +106,9 @@ class Engine:
         self.active = {}
         self.cancelled = set()
         self._status = None
+        self._status_lock = threading.Lock()
+        self._resolved_tools = {}
+        self._status_revision = 0
         self._estimate_cache = {}
         self._frame_caches = {}
         self._queue = queue.Queue()
@@ -121,57 +127,91 @@ class Engine:
         self.jobs = dict(sorted(self.jobs.items(), key=lambda pair: pair[1]['created'], reverse=True)[:150])
         threading.Thread(target=self._worker, daemon=True, name='encode-queue').start()
 
-    def _tool(self, name):
-        configured = self.config.get(name)
+    def _tool_candidates(self, name, config):
+        configured = config.get(name)
         if configured:
-            return str(Path(configured).expanduser().resolve()) if Path(configured).expanduser().is_file() else (shutil.which(configured) or configured)
-        if name == 'ffprobe' and self.config.get('ffmpeg'):
-            ff = Path(self.config['ffmpeg']).expanduser()
+            return [str(Path(configured).expanduser().resolve()) if Path(configured).expanduser().is_file() else (shutil.which(configured) or configured)]
+        candidates = []
+        if name == 'ffprobe' and config.get('ffmpeg'):
+            ff = Path(config['ffmpeg']).expanduser()
             probe = ff.parent / ('ffprobe.exe' if ff.suffix.lower() == '.exe' else 'ffprobe')
             if probe.is_file():
-                return str(probe.resolve())
+                candidates.append(str(probe.resolve()))
+        installed = shutil.which(name)
+        if installed:
+            candidates.append(installed)
         for directory in (self.root / 'bin', self.root):
             for ext in ('.exe', '') if os.name == 'nt' else ('', '.exe'):
                 bundled = directory / (name + ext)
                 if bundled.is_file():
-                    return str(bundled)
-        return shutil.which(name) or name
+                    candidates.append(str(bundled))
+        return list(dict.fromkeys(candidates)) or [name]
+
+    def _tool(self, name):
+        with self.lock:
+            return self._resolved_tools.get(name) or self._tool_candidates(name, self.config)[0]
 
     def status(self):
+        # One probe batch at a time. The jobs lock remains free while programs run.
         with self.lock:
             if self._status is not None:
                 return copy.deepcopy(self._status)
-        config_snapshot = copy.deepcopy(self.config)
-        tools = {}
-        for name in ('gifski', 'ffmpeg', 'ffprobe'):
-            path = self._tool(name)
-            item = {'path': path, 'available': False, 'version': '', 'help': ''}
-            try:
-                r = subprocess.run([path, '--version' if name == 'gifski' else '-version'], capture_output=True, text=True, errors='replace', timeout=10)
-                combined = (r.stdout + r.stderr).strip()
-                item.update(available=r.returncode == 0, version=combined.splitlines()[0] if combined else '')
-                if name == 'gifski' and item['available']:
-                    h = subprocess.run([path, '--help'], capture_output=True, text=True, errors='replace', timeout=10)
-                    item['help'] = (h.stdout + h.stderr).strip()
-                    item['flags'] = sorted(set(re.findall(r'--[a-z][a-z-]+', item['help'])))
-            except (OSError, subprocess.TimeoutExpired) as e:
-                item['error'] = str(e)
-            tools[name] = item
-        result = {'tools': tools, 'config': copy.deepcopy(self.config), 'defaults': copy.deepcopy(DEFAULTS), 'outputDirectory': str(self.outputs)}
+        with self._status_lock:
+            with self.lock:
+                if self._status is not None:
+                    return copy.deepcopy(self._status)
+                config_snapshot = copy.deepcopy(self.config)
+                revision = self._status_revision
+            def inspect(name):
+                for path in self._tool_candidates(name, config_snapshot):
+                    origin = ('config' if config_snapshot.get(name) or (name == 'ffprobe' and config_snapshot.get('ffmpeg') and path != shutil.which(name))
+                              else 'path' if path == shutil.which(name) else 'local')
+                    item = {'path': path, 'origin': origin, 'available': False, 'version': '', 'help': ''}
+                    try:
+                        r = subprocess.run([path, '--version' if name == 'gifski' else '-version'], capture_output=True, text=True, errors='replace', timeout=5)
+                        combined = (r.stdout + r.stderr).strip()
+                        item.update(available=r.returncode == 0, version=combined.splitlines()[0][:1000] if combined else '')
+                        if not item['available']:
+                            item['error'] = combined[-1000:] or f'Exited with code {r.returncode}.'
+                            continue
+                        if name == 'gifski':
+                            try:
+                                h = subprocess.run([path, '--help'], capture_output=True, text=True, errors='replace', timeout=5)
+                                item['help'] = (h.stdout + h.stderr).strip()[:100000]
+                                item['flags'] = sorted(set(re.findall(r'--[a-z][a-z-]+', item['help'])))
+                            except (OSError, subprocess.TimeoutExpired) as e:
+                                item['helpError'] = str(e)
+                        break
+                    except (OSError, subprocess.TimeoutExpired) as e:
+                        item['error'] = str(e)
+                return name, item
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix='tool-version') as pool:
+                tools = dict(pool.map(inspect, ('gifski', 'ffmpeg', 'ffprobe')))
+            result = {'tools': tools, 'config': config_snapshot, 'defaults': copy.deepcopy(DEFAULTS), 'outputDirectory': str(self.outputs)}
+            with self.lock:
+                if self.config == config_snapshot and revision == self._status_revision:
+                    self._resolved_tools = {name: item['path'] for name, item in tools.items()}
+                    self._status = result
+            return copy.deepcopy(result)
+
+    def invalidate_status(self):
         with self.lock:
-            if self.config == config_snapshot:
-                self._status = result
-        return copy.deepcopy(result)
+            self._status = None
+            self._resolved_tools.clear()
+            self._status_revision += 1
 
     def configure(self, values):
+        patch = {}
+        for k in ('gifski', 'ffmpeg', 'ffprobe'):
+            if k in values:
+                if not isinstance(values[k], str) or len(values[k]) > 4096 or '\x00' in values[k]:
+                    raise ValueError(f'Invalid {k} executable path.')
+                patch[k] = values[k].strip().strip('"')
         with self.lock:
-            for k in ('gifski', 'ffmpeg', 'ffprobe'):
-                if k in values:
-                    if not isinstance(values[k], str) or len(values[k]) > 4096 or '\x00' in values[k]:
-                        raise ValueError(f'Invalid {k} executable path.')
-                    self.config[k] = values[k].strip().strip('"')
-            self._write_json(self.config_path, self.config)
-            self._status = None
+            updated = dict(self.config, **patch)
+            self._write_json(self.config_path, updated)
+            self.config = updated
+            self.invalidate_status()
         return self.status()
 
     @staticmethod
@@ -212,12 +252,14 @@ class Engine:
             paths.append(p)
         return paths
 
-    def probe(self, source):
+    def probe(self, source, jid=None):
         paths = self._paths(source)
         path = paths[0]
         result = {'path': str(path), 'name': path.name, 'kind': source.get('kind', 'video'), 'bytes': sum(p.stat().st_size for p in paths), 'frameCount': len(paths) if source.get('kind') == 'sequence' else None}
         try:
-            r = subprocess.run([self._tool('ffprobe'), '-protocol_whitelist', 'file,pipe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)], capture_output=True, text=True, errors='replace', timeout=30)
+            command = [self._tool('ffprobe'), '-protocol_whitelist', 'file,pipe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]
+            r = (self._capture_probe(jid, command) if jid is not None else
+                 subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=30))
             if r.returncode:
                 raise ValueError(r.stderr[-2000:] or 'FFprobe could not read the source.')
             data = json.loads(r.stdout)
@@ -256,7 +298,7 @@ class Engine:
                 result['frameCount'] = int(stream['nb_frames'])
         except FileNotFoundError:
             if path.suffix.lower() != '.png':
-                raise ValueError('FFprobe was not found. Set its executable path in Tools.') from None
+                raise ValueError('FFprobe was not found. Set its executable path in Settings.') from None
             with path.open('rb') as f:
                 data = f.read(26)
             if len(data) < 26 or data[:8] != b'\x89PNG\r\n\x1a\n':
@@ -271,7 +313,7 @@ class Engine:
         if not isinstance(settings, dict):
             raise ValueError('Settings must be a JSON object.')
         s = merged(DEFAULTS, settings)
-        for group in ('source', 'trim', 'crop', 'sweep', 'optimize', 'smart'):
+        for group in ('source', 'trim', 'crop', 'sweep', 'optimize', 'smart', 'performance'):
             if not isinstance(s[group], dict):
                 raise ValueError(f'Invalid {group} settings.')
         for flag in ('bounce', 'noSort', 'quiet', 'reverse'):
@@ -280,6 +322,9 @@ class Engine:
         if not isinstance(s['crop']['enabled'], bool):
             raise ValueError('Crop enabled must be true or false.')
         self._paths(s['source'])
+        s['performance']['threads'] = number(s['performance']['threads'], 'FFmpeg threads', 0, 256, integer=True)
+        if s['performance']['hardwareDecode'] not in ('none', 'auto'):
+            raise ValueError('Unknown hardware decoding option.')
         s['smart']['targetMB'] = number(s['smart']['targetMB'], 'Target MB', .001, 100000)
         if s['smart']['effort'] not in ('quick', 'balanced', 'thorough'):
             raise ValueError('Unknown search effort.')
@@ -367,7 +412,15 @@ class Engine:
         return cmd + list(map(str, inputs))
 
     def _ffmpeg(self, s, source, dest, pipeline, sequence_pattern=None):
-        cmd = [self._tool('ffmpeg'), '-hide_banner', '-nostdin', '-y', '-v', 'warning', '-protocol_whitelist', 'file,pipe']
+        performance = s['performance']
+        threads = performance['threads'] or min(os.cpu_count() or 1, 8)
+        cmd = [self._tool('ffmpeg'), '-hide_banner', '-nostdin', '-y', '-v', 'warning',
+               '-nostats', '-stats_period', '0.5', '-progress', 'pipe:2',
+               '-filter_threads', str(threads), '-protocol_whitelist', 'file,pipe']
+        if performance['threads']:
+            cmd += ['-threads', str(threads)]
+        if performance['hardwareDecode'] == 'auto' and not sequence_pattern:
+            cmd += ['-hwaccel', 'auto']
         if s['trim']['start']:
             cmd += ['-ss', f"{s['trim']['start']:g}"]
         if s['trim']['end'] is not None:
@@ -398,7 +451,7 @@ class Engine:
             filters.append(s['customFilter'].strip())
         cmd += ['-map', '0:v:0', '-an', '-sn', '-dn', '-vf', ','.join(filters)]
         if pipeline == 'png':
-            cmd += ['-frames:v', '100001', '-fps_mode', 'passthrough', '-pix_fmt', 'rgba', '-threads', '1', '-start_number', '0', str(dest)]
+            cmd += ['-frames:v', '100001', '-fps_mode', 'passthrough', '-pix_fmt', 'rgba', '-threads', str(threads), '-start_number', '0', str(dest)]
         else:
             cmd += ['-pix_fmt', 'yuv444p', '-strict', '-1', '-f', 'yuv4mpegpipe', str(dest)]
         return cmd
@@ -465,7 +518,7 @@ class Engine:
         required = ['gifski'] + (['ffmpeg'] if plan['pipeline'] in ('png', 'y4m') else [])
         missing = [x for x in required if not status['tools'][x]['available']]
         if missing:
-            raise ValueError('Missing executable(s): ' + ', '.join(missing) + '. Set the paths in Tools or place the executables in bin/.')
+            raise ValueError('Missing executable(s): ' + ', '.join(missing) + '. Set the paths in Settings or place the executables in bin/.')
         if mode == 'sweep':
             self._sweep_settings(s)
         if mode == 'optimize':
@@ -490,6 +543,22 @@ class Engine:
     def list_jobs(self):
         with self.lock:
             return copy.deepcopy(sorted(self.jobs.values(), key=lambda j: j['created'], reverse=True))
+
+    def list_job_summaries(self):
+        with self.lock:
+            summaries = []
+            for job in sorted(self.jobs.values(), key=lambda j: j['created'], reverse=True):
+                item = {key: job.get(key) for key in ('id', 'status', 'mode', 'created', 'started', 'finished',
+                                                     'stage', 'progress', 'bestIndex', 'error')}
+                source = job.get('settings', {}).get('source', {})
+                name = source.get('path') or next(iter(source.get('paths') or []), '')
+                item.update(sourceName=re.split(r'[/\\]', name)[-1], resultCount=len(job.get('results', [])))
+                summaries.append(item)
+            return summaries
+
+    def has_active_jobs(self):
+        with self.lock:
+            return any(job.get('status') in ('queued', 'running') for job in self.jobs.values())
 
     def get_job(self, jid):
         with self.lock:
@@ -522,8 +591,12 @@ class Engine:
         self._write_json(self.outputs / job['id'] / 'job.json', job)
 
     def _log(self, jid, line):
+        line = re.sub(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))', '', str(line))
+        line = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', line).strip()
+        if not line:
+            return
         with self.lock:
-            self.jobs[jid]['logs'].append(str(line)[-4000:])
+            self.jobs[jid].setdefault('logs', []).append(time.strftime('[%H:%M:%S] ') + line[-4000:])
             self.jobs[jid]['logs'] = self.jobs[jid]['logs'][-250:]
 
     def _check_cancel(self, jid):
@@ -534,112 +607,290 @@ class Engine:
         with self.lock:
             self.active.setdefault(jid, []).append(process)
 
+    @staticmethod
+    def _stop_process(process):
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            except ProcessLookupError:
+                pass
+
+    def _start_process(self, jid, process, label):
+        now = time.time()
+        with self.lock:
+            record = {'tool': label, 'pid': process.pid, 'status': 'running',
+                      'startedAt': now, 'updatedAt': now, 'lastOutputAt': now,
+                      'elapsedSeconds': 0, 'frame': None, 'fps': None, 'speed': None,
+                      'outTimeSeconds': None, 'expectedSeconds': self.jobs[jid].get('stageExpectedSeconds'),
+                      'percent': None, 'stalled': False}
+            self.jobs[jid]['process'] = record
+        self._log(jid, f'{label} started (process {process.pid}).')
+        return record
+
+    def _heartbeat(self, jid, record):
+        now = time.time()
+        with self.lock:
+            record.update(updatedAt=now, elapsedSeconds=round(now - record['startedAt'], 1),
+                          stalled=now - record['lastOutputAt'] >= 30)
+        return now
+
+    def _read_output(self, jid, pipe, label, record, outputs, ffmpeg=False, frame_progress=False):
+        """Drain every pipe continuously, including CR-only terminal progress.
+
+        A bounded incremental decoder avoids readline waiting forever on carriage
+        returns, accumulating huge unterminated output, or splitting UTF-8 bytes.
+        FFmpeg progress uses stderr so Y4M stdout remains binary and untouched.
+        """
+        decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        pending = ''
+        last_redraw, last_line = 0, None
+        progress_keys = {'frame', 'fps', 'bitrate', 'total_size', 'out_time_us', 'out_time_ms',
+                         'out_time', 'dup_frames', 'drop_frames', 'speed', 'progress'}
+        def accept(raw):
+            nonlocal last_redraw, last_line
+            line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw).strip()
+            if not line:
+                return
+            with self.lock:
+                record['lastOutputAt'] = time.time()
+            key, separator, value = line.partition('=')
+            if ffmpeg and separator and (key in progress_keys or re.fullmatch(r'stream_\d+_\d+_q', key)):
+                with self.lock:
+                    try:
+                        if key in ('frame', 'fps', 'out_time_us', 'out_time_ms'):
+                            value_number = float(value)
+                            if math.isfinite(value_number) and value_number >= 0:
+                                if key == 'frame':
+                                    record['frame'] = int(value_number)
+                                elif key == 'fps':
+                                    record['fps'] = value_number
+                                else:
+                                    record['outTimeSeconds'] = value_number / 1_000_000
+                        elif key == 'speed' and re.fullmatch(r'\s*\d+(?:\.\d+)?x', value):
+                            record['speed'] = value.strip()
+                        elif key == 'progress':
+                            duration = record.get('expectedSeconds')
+                            position = record.get('outTimeSeconds')
+                            if duration and position is not None:
+                                record['percent'] = round(min(99.9, max(0, position / duration * 100)), 1)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                return
+            redraw = re.search(r'\bFrame\s+(\d+)\s*/\s*(\d+)', line) if label == 'Gifski' else None
+            if redraw:
+                current, total = map(int, redraw.groups())
+                if frame_progress and total > 0:
+                    with self.lock:
+                        record.update(frame=current, totalFrames=total,
+                                      percent=round(min(99.9, current / total * 100), 1))
+                now = time.monotonic()
+                if line == last_line or (now - last_redraw < .5 and current < total):
+                    return
+                last_redraw, last_line = now, line
+            line = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', line)[-4000:]
+            with self.lock:
+                outputs.append(label + ': ' + line)
+                del outputs[:-100]
+            self._log(jid, label + ': ' + line)
+        try:
+            while True:
+                raw = pipe.read1(4096) if hasattr(pipe, 'read1') else pipe.read(4096)
+                if not raw:
+                    pending += decoder.decode(b'', final=True)
+                    break
+                pending += decoder.decode(raw)
+                pieces = re.split(r'[\r\n]', pending)
+                pending = pieces.pop()
+                for line in pieces:
+                    accept(line)
+                if len(pending) > 4096:
+                    accept(pending[:4096])
+                    pending = pending[4096:]
+            if pending:
+                accept(pending)
+        except (OSError, ValueError) as error:
+            # A pipe can be closed by process teardown. Keep other pipes draining.
+            self._log(jid, f'{label} output stream closed: {error}')
+        finally:
+            pipe.close()
+
+    def _finish_process(self, jid, process, record):
+        with self.lock:
+            self._heartbeat(jid, record)
+            record.update(status='cancelled' if jid in self.cancelled else 'failed' if process.returncode else 'completed',
+                          exitCode=process.returncode, stalled=False)
+            if not process.returncode:
+                record['percent'] = 100
+            if process in self.active.get(jid, []):
+                self.active[jid].remove(process)
+        self._log(jid, f"{record['tool']} exited with code {process.returncode} after {record['elapsedSeconds']:g}s.")
+
+    def _capture_probe(self, jid, command, timeout=30):
+        """Capture probe JSON without logging it; job cancellation reaps the child.
+
+        communicate() drains stdout and stderr concurrently, including on Windows.
+        Retrying it after a short timeout preserves captured output and keeps the
+        cancellation interval independent of the overall inspection timeout.
+        """
+        self._check_cancel(jid)
+        with self.lock:
+            self.jobs[jid].setdefault('commands', []).append(command)
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, errors='replace')
+        self._track(jid, process)
+        record = self._start_process(jid, process, 'FFprobe')
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                self._check_cancel(jid)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                self._heartbeat(jid, record)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(.1, remaining))
+                    self._check_cancel(jid)
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            self._stop_process(process)
+            # Finish communicate's pipe-reader threads and close their handles
+            # before Windows cleanup or the next queued job can begin.
+            process.communicate(timeout=3)
+            self._finish_process(jid, process, record)
+
     def _run(self, jid, cmd, cwd=None, stdin=None, stdout=None):
         self._check_cancel(jid)
         with self.lock:
-            self.jobs[jid]['commands'].append(cmd)
-        p = subprocess.Popen(cmd, cwd=cwd, stdin=stdin or subprocess.DEVNULL, stdout=stdout if stdout is not None else subprocess.PIPE, stderr=subprocess.PIPE)
+            self.jobs[jid].setdefault('commands', []).append(cmd)
+        p = subprocess.Popen(cmd, cwd=cwd, stdin=stdin if stdin is not None else subprocess.DEVNULL,
+                             stdout=stdout if stdout is not None else subprocess.PIPE, stderr=subprocess.PIPE)
         self._track(jid, p)
-        outputs = []
-        def reader(pipe):
-            try:
-                for raw in iter(pipe.readline, b''):
-                    line = raw.decode('utf-8', 'replace').strip()
-                    if line:
-                        outputs.append(line)
-                        if len(outputs) > 100:
-                            del outputs[:-100]
-                        self._log(jid, line)
-            finally:
-                pipe.close()
-        threads = [threading.Thread(target=reader, args=(p.stderr,), daemon=True)]
-        if stdout is None:
-            threads.append(threading.Thread(target=reader, args=(p.stdout,), daemon=True))
-        for t in threads:
-            t.start()
-        while p.poll() is None:
-            if jid in self.cancelled:
-                p.terminate()
-                try:
-                    p.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait()
-                break
-            time.sleep(.12)
-        for t in threads:
-            t.join(timeout=3)
-        with self.lock:
-            self.active[jid].remove(p)
+        label = 'FFmpeg' if '-progress' in cmd else 'Gifski' if '--output' in cmd else Path(cmd[0]).name
+        record = self._start_process(jid, p, label)
+        outputs, threads = [], []
+        try:
+            for pipe in [p.stderr] + ([p.stdout] if stdout is None else []):
+                thread = threading.Thread(target=self._read_output,
+                                          args=(jid, pipe, label, record, outputs, label == 'FFmpeg',
+                                                label == 'Gifski' and str(cmd[-1]).lower().endswith('.png')), daemon=True)
+                thread.start()
+                threads.append(thread)
+            last_log = time.time()
+            while p.poll() is None:
+                if jid in self.cancelled:
+                    self._stop_process(p)
+                    break
+                now = self._heartbeat(jid, record)
+                if now - last_log >= 10:
+                    details = f", {record['frame']:,} frames" if record['frame'] is not None else ''
+                    if record['speed']:
+                        details += f", {record['speed']} playback speed"
+                    self._log(jid, f"{label} running for {record['elapsedSeconds']:g}s{details}.")
+                    last_log = now
+                time.sleep(.1)
+            p.wait()
+        finally:
+            self._stop_process(p)
+            for thread in threads:
+                thread.join(timeout=3)
+            self._finish_process(jid, p, record)
         self._check_cancel(jid)
         if p.returncode:
-            raise RuntimeError(f'{Path(cmd[0]).name} exited with code {p.returncode}:\n' + '\n'.join(outputs[-12:]))
+            raise RuntimeError(f'{label} exited with code {p.returncode}:\n' + '\n'.join(outputs[-12:]))
 
     def _run_pipe(self, jid, producer, consumer):
         self._check_cancel(jid)
         with self.lock:
-            self.jobs[jid]['commands'].extend([producer, consumer])
+            self.jobs[jid].setdefault('commands', []).extend([producer, consumer])
         ff = subprocess.Popen(producer, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self._track(jid, ff)
+        ff_record = self._start_process(jid, ff, 'FFmpeg')
+        gs, gs_record = None, None
+        outputs, threads = [], []
         try:
             gs = subprocess.Popen(consumer, stdin=ff.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception:
-            ff.terminate()
-            try:
-                ff.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ff.kill()
-                ff.wait(timeout=3)
+            self._track(jid, gs)
+            gs_record = self._start_process(jid, gs, 'Gifski')
             ff.stdout.close()
-            ff.stderr.close()
             with self.lock:
-                self.active[jid].remove(ff)
-            raise
-        self._track(jid, gs)
-        ff.stdout.close()
-        outputs = []
-        def read(pipe, label):
-            try:
-                for raw in iter(pipe.readline, b''):
-                    line = raw.decode('utf-8', 'replace').strip()
-                    if line:
-                        outputs.append(label + ': ' + line)
-                        if len(outputs) > 100:
-                            del outputs[:-100]
-                        self._log(jid, label + ': ' + line)
-            finally:
-                pipe.close()
-        threads = [threading.Thread(target=read, args=(pipe, label), daemon=True)
-                   for pipe, label in [(ff.stderr, 'FFmpeg'), (gs.stdout, 'Gifski'), (gs.stderr, 'Gifski')]]
-        for t in threads:
-            t.start()
-        try:
+                self.jobs[jid]['process'] = ff_record
+            for pipe, label, record in ((ff.stderr, 'FFmpeg', ff_record),
+                                        (gs.stdout, 'Gifski', gs_record), (gs.stderr, 'Gifski', gs_record)):
+                thread = threading.Thread(target=self._read_output,
+                                          args=(jid, pipe, label, record, outputs, label == 'FFmpeg'), daemon=True)
+                thread.start()
+                threads.append(thread)
+            last_log = time.time()
+            consumer_finished_at = None
             while ff.poll() is None or gs.poll() is None:
-                if jid in self.cancelled or (gs.poll() not in (None, 0)):
-                    for proc in (ff, gs):
-                        if proc.poll() is None:
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
+                # A failed producer must also terminate a consumer waiting for
+                # more work. Conversely, stop a producer whose consumer exited.
+                if gs.poll() == 0 and consumer_finished_at is None:
+                    consumer_finished_at = time.monotonic()
+                orphaned_producer = consumer_finished_at is not None and time.monotonic() - consumer_finished_at >= 2
+                if jid in self.cancelled or ff.poll() not in (None, 0) or gs.poll() not in (None, 0) or orphaned_producer:
+                    self._stop_process(ff)
+                    self._stop_process(gs)
                     break
-                time.sleep(.12)
-            for proc in (ff, gs):
-                proc.wait()
-            for t in threads:
-                t.join(timeout=3)
-            self._check_cancel(jid)
-            if ff.returncode or gs.returncode:
-                raise RuntimeError(f'Y4M pipeline failed (FFmpeg {ff.returncode}, Gifski {gs.returncode}):\n' + '\n'.join(outputs[-12:]))
+                current = ff_record if ff.poll() is None else gs_record
+                with self.lock:
+                    self.jobs[jid]['process'] = current
+                now = self._heartbeat(jid, current)
+                if now - last_log >= 10:
+                    self._log(jid, f"{current['tool']} running for {current['elapsedSeconds']:g}s.")
+                    last_log = now
+                time.sleep(.1)
+            ff.wait()
+            gs.wait()
         finally:
             for proc in (ff, gs):
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
+                if proc is not None:
+                    self._stop_process(proc)
+            for thread in threads:
+                thread.join(timeout=3)
+            for proc, record in ((ff, ff_record), (gs, gs_record)):
+                if proc is not None:
+                    # Also closes handles when consumer creation failed before
+                    # reader threads were started (notably Windows file handles).
+                    for pipe in (proc.stdout, proc.stderr):
+                        if pipe is not None and not pipe.closed and not any(t.is_alive() for t in threads):
+                            pipe.close()
+                    self._finish_process(jid, proc, record)
+        self._check_cancel(jid)
+        if ff.returncode or gs.returncode:
+            raise RuntimeError(f'Y4M pipeline failed (FFmpeg {ff.returncode}, Gifski {gs.returncode}):\n' + '\n'.join(outputs[-12:]))
+
+    def _run_ffmpeg(self, jid, command, frames=None, consumer=None):
+        def software_command():
+            index = command.index('-hwaccel')
+            return command[:index] + command[index + 2:]
+        if '-hwaccel' in command and self.jobs[jid].get('hardwareDecodeFallback'):
+            command = software_command()
+        try:
+            if consumer is None:
+                self._run(jid, command)
+            else:
+                self._run_pipe(jid, command, consumer)
+        except RuntimeError:
+            self._check_cancel(jid)
+            if '-hwaccel' not in command:
+                raise
+            self._log(jid, 'The hardware-assisted attempt failed. Retrying with CPU decoding.')
             with self.lock:
-                for proc in (ff, gs):
-                    self.active[jid].remove(proc)
+                self.jobs[jid]['hardwareDecodeFallback'] = True
+            if frames is not None:
+                for path in frames.glob('*.png'):
+                    path.unlink()
+            if consumer is None:
+                self._run(jid, software_command())
+            else:
+                self._run_pipe(jid, software_command(), consumer)
 
     def _encode(self, jid, s, index, total, record=True):
         self._check_cancel(jid)
@@ -654,6 +905,12 @@ class Engine:
         started = time.monotonic()
         completed = False
         with self.lock:
+            duration = self.jobs[jid].get('sourceMetadata', {}).get('duration')
+            if s['source']['kind'] == 'sequence':
+                duration = len(paths) / s.get('_sequenceInputFps', s['fps'])
+            if s['trim']['end'] is not None:
+                duration = min(duration, s['trim']['end']) if duration else s['trim']['end']
+            self.jobs[jid]['stageExpectedSeconds'] = max(0, duration - s['trim']['start']) / s['speed'] if duration else None
             if record:
                 adaptive = self.jobs[jid]['mode'] in ('smart', 'discord')
                 progress = 40 + index / total * 55 if adaptive else index / total * 100
@@ -705,7 +962,7 @@ class Engine:
                         cmd = self._ffmpeg(s, paths[0], frames / 'f%06d.png', 'png', sequence)
                         with self.lock:
                             self.jobs[jid]['stage'] = ('Sampling source' if not record else f'Preparing full export {index + 1}')
-                        self._run(jid, cmd)
+                        self._run_ffmpeg(jid, cmd, frames=frames)
                         inputs = sorted(p.name for p in frames.glob('*.png'))
                         if len(inputs) < 2:
                             raise ValueError('The selected clip produced fewer than two frames. Increase its duration or FPS.')
@@ -742,7 +999,7 @@ class Engine:
                     if sequence:
                         actual['fps'] *= actual['speed']
                     gs = self._gifski(actual, output, ['-'], 'y4m')
-                    self._run_pipe(jid, ff, gs)
+                    self._run_ffmpeg(jid, ff, consumer=gs)
             w, h = gif_dimensions(output)
             result = {'index': index, 'filename': output.name, 'bytes': output.stat().st_size, 'width': w, 'height': h,
                       'fps': s['fps'] * s['speed'] if s['source']['kind'] == 'sequence' else s['fps'], 'quality': s['quality'],
@@ -794,7 +1051,7 @@ class Engine:
         # Retain resolution first, then FPS, then the highest tested quality that fits.
         base_width = s['width']
         if base_width is None:
-            base_width = self.probe(s['source'])['width']
+            base_width = (self.jobs[jid].get('sourceMetadata') or self.probe(s['source'], jid=jid))['width']
         widths = [base_width]
         if o['allowResize'] and o['minWidth'] < base_width:
             widths += [max(o['minWidth'], round(base_width * x)) for x in (.85, .70, .55)] + [o['minWidth']]
@@ -939,7 +1196,9 @@ class Engine:
         return summary
 
     def _estimate(self, jid, s):
-        metadata = self.probe(s['source'])
+        metadata = self.jobs[jid].get('sourceMetadata') or self.probe(s['source'], jid=jid)
+        with self.lock:
+            self.jobs[jid]['sourceMetadata'] = metadata
         if not metadata.get('duration') and s['trim']['end'] is not None:
             metadata['duration'] = s['trim']['end']
         start, end = self._source_interval(s, metadata)
@@ -1003,7 +1262,9 @@ class Engine:
         """Shared Smart/Discord search: cheap screening, then measured exports."""
         job = self.jobs[jid]
         target = 20_000_000 if job['mode'] == 'discord' else round(s['smart']['targetMB'] * 1_000_000)
-        metadata = self.probe(s['source'])
+        metadata = self.jobs[jid].get('sourceMetadata') or self.probe(s['source'], jid=jid)
+        with self.lock:
+            self.jobs[jid]['sourceMetadata'] = metadata
         if not metadata.get('duration') and s['trim']['end'] is not None:
             metadata['duration'] = s['trim']['end']
         base, base_width, base_fps = self._discord_settings(s, metadata)
@@ -1202,6 +1463,18 @@ class Engine:
                     job = self.jobs[jid]
                     job.update(status='running', started=time.time())
                     settings = copy.deepcopy(job['settings'])
+                self._log(jid, f"Started {job['mode']} job.")
+                with self.lock:
+                    job['stage'] = 'Inspecting source'
+                try:
+                    metadata = self.probe(settings['source'], jid=jid)
+                    with self.lock:
+                        job['sourceMetadata'] = metadata
+                except (ValueError, OSError):
+                    # Direct Gifski decoding does not require FFprobe. Unknown
+                    # duration leaves progress indeterminate, never fabricated.
+                    self._log(jid, 'Source duration unavailable; showing live frame counts and elapsed time.')
+                self._check_cancel(jid)
                 if job['mode'] == 'optimize':
                     self._optimize(jid, settings)
                 elif job['mode'] == 'estimate':
@@ -1217,9 +1490,11 @@ class Engine:
                 self._check_cancel(jid)
                 with self.lock:
                     job.update(status='completed', stage='Complete', progress=100, finished=time.time())
+                self._log(jid, 'Job complete.')
             except Cancelled:
                 with self.lock:
                     self.jobs[jid].update(status='cancelled', stage='Cancelled', finished=time.time())
+                self._log(jid, 'Job cancelled.')
             except Exception as e:
                 with self.lock:
                     self.jobs[jid].update(status='failed', stage='Failed', error=str(e), finished=time.time())

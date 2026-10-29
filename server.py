@@ -42,9 +42,7 @@ class Server(ThreadingHTTPServer):
 
 
     def invalidate_tools(self):
-        if hasattr(self.engine, "lock"):
-            with self.engine.lock:
-                self.engine._status = None
+        self.engine.invalidate_status()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -261,7 +259,9 @@ class Handler(BaseHTTPRequestHandler):
             if route == '/api/status':
                 return self.send_json(self.server.engine.status())
             if route == '/api/jobs':
-                return self.send_json({'jobs': self.server.engine.list_jobs()})
+                summaries = urllib.parse.parse_qs(parsed.query).get('summary') == ['1']
+                jobs = self.server.engine.list_job_summaries() if summaries else self.server.engine.list_jobs()
+                return self.send_json({'jobs': jobs})
             match = re.fullmatch(r'/api/jobs/([A-Za-z0-9_-]+)', route)
             if match:
                 job = self.server.engine.get_job(match[1])
@@ -333,16 +333,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.invalidate_tools()
                 return self.send_json(self.server.engine.status())
             if route == '/api/dependencies/check-updates':
-                self.server.invalidate_tools()
                 return self.send_json(self.server.dependencies.check_updates(self.server.engine.status().get('tools', {})), 202)
+            if route == '/api/dependencies/install-missing':
+                with self.server.operation_lock:
+                    if self.server.engine.has_active_jobs():
+                        return self.send_json({'error': 'Finish or cancel queued jobs before installing tools.'}, 409)
+                    self.server.invalidate_tools()
+                    installed = self.server.engine.status().get('tools', {})
+                    return self.send_json(self.server.dependencies.install_missing(installed), 202)
             if route == '/api/dependencies/install':
                 with self.server.operation_lock:
-                    if any(job.get('status') in ('queued', 'running') for job in self.server.engine.list_jobs()):
+                    if self.server.engine.has_active_jobs():
                         return self.send_json({'error': 'Finish or cancel queued jobs before installing tools.'}, 409)
                     return self.send_json(self.server.dependencies.install(body.get('tool')), 202)
             if route == '/api/config':
                 with self.server.operation_lock:
-                    if self.server.dependencies.status()['busy'] or any(job.get('status') in ('queued', 'running') for job in self.server.engine.list_jobs()):
+                    if self.server.dependencies.status()['busy'] or self.server.engine.has_active_jobs():
                         return self.send_json({'error': 'Finish active jobs and installations before changing executable paths.'}, 409)
                     return self.send_json(self.server.engine.configure(body))
             if route == '/api/probe':
@@ -399,7 +405,7 @@ def main():
     except KeyboardInterrupt:
         print('\nStopping active jobs...')
     finally:
-        for job in engine.list_jobs():
+        for job in engine.list_job_summaries():
             if job.get('status') in ('queued', 'running'):
                 engine.cancel(job['id'])
         server.server_close()

@@ -3,9 +3,12 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import socket
+import ssl
 import struct
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -194,7 +197,7 @@ class DependencyTests(unittest.TestCase):
 
     def test_check_cache_and_inflight_coalescing(self):
         manager = dep.DependencyManager(self.root)
-        with patch.object(manager, '_latest_release', side_effect=['1.34.0', '8.0.1']):
+        with patch.object(manager, '_latest_release', side_effect=lambda name: {'gifski': '1.34.0', 'ffmpeg': '8.0.1'}[name]):
             manager._check_worker()
         with patch.object(dep.threading, 'Thread') as thread:
             self.assertTrue(manager.check_updates()['updates']['cached'])
@@ -205,13 +208,138 @@ class DependencyTests(unittest.TestCase):
 
     def test_provider_failure_isolated_and_error_does_not_leak_url(self):
         manager = dep.DependencyManager(self.root)
-        with patch.object(manager, '_latest_release', side_effect=[ValueError('https://signed.example/secret'), '8.0.1']):
+        def latest(name):
+            if name == 'gifski':
+                raise ValueError('https://signed.example/secret')
+            return '8.0.1'
+        with patch.object(manager, '_latest_release', side_effect=latest):
             manager._check_worker()
         status = manager.status()['updates']
         self.assertEqual(status['state'], 'partial')
         self.assertEqual(status['tools']['gifski']['state'], 'error')
         self.assertEqual(status['tools']['ffmpeg']['latestVersion'], '8.0.1')
         self.assertNotIn('secret', json.dumps(status))
+
+    def test_gifski_api_rate_limit_falls_back_to_exact_release_page_identity(self):
+        manager = dep.DependencyManager(self.root)
+        error = dep.urllib.error.HTTPError(dep.GITHUB_RELEASE, 403, 'blocked', {'X-RateLimit-Remaining': '0'}, None)
+        html = b'<a href="/ImageOptim/gifski/releases/tag/99.0.0">Unrelated link</a><meta content="/ImageOptim/gifski/releases/tag/1.34.0" property="og:url">'
+        with patch.object(dep, '_read_small', side_effect=[error, html]) as read:
+            self.assertEqual(manager._latest_release('gifski'), '1.34.0')
+        self.assertEqual([call.args[0] for call in read.call_args_list], [dep.GITHUB_RELEASE, dep.GIFSKI_RELEASE_PAGE])
+        self.assertEqual(manager.release_sources['gifski']['sourceUsed'], 'Gifski release page')
+        for url in ('https://evil.test/ImageOptim/gifski/releases/tag/1.34.0',
+                    '/Another/gifski/releases/tag/1.34.0', '/ImageOptim/gifski/releases/tag/1.35.0-beta'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                manager._gifski_page(f'<meta property="og:url" content="{url}">'.encode())
+
+    def test_ffmpeg_outage_falls_back_to_stable_tags_on_official_mirror(self):
+        manager = dep.DependencyManager(self.root)
+        tags = [{'name': value} for value in ('n9.0.1', 'n9.1-dev', 'n8.1.3', 'n9.0.2', 'v0.6.1', 'n10.0-rc1')]
+        error = dep.urllib.error.HTTPError(dep.FFMPEG_RELEASES, 503, 'unavailable', {}, None)
+        with patch.object(dep, '_read_small', side_effect=[error, json.dumps(tags).encode()]):
+            self.assertEqual(manager._latest_release('ffmpeg'), '9.0.2')
+        self.assertEqual(manager.release_sources['ffmpeg']['sourceUrl'], 'https://github.com/FFmpeg/FFmpeg/tags')
+
+    def test_provider_diagnostics_are_actionable_and_do_not_expose_raw_errors(self):
+        url = 'https://signed.example/secret'
+        cases = [
+            (dep.urllib.error.URLError(socket.gaierror(-2, url)), 'dns'),
+            (dep.urllib.error.URLError(ssl.SSLCertVerificationError(1, url)), 'certificate'),
+            (dep.urllib.error.URLError(TimeoutError(url)), 'timeout'),
+            (dep.urllib.error.HTTPError(url, 429, url, {}, None), 'rate_limited'),
+            (dep.urllib.error.HTTPError(url, 503, url, {}, None), 'provider_unavailable'),
+            (dep.urllib.error.HTTPError(url, 407, url, {}, None), 'proxy'),
+            (ValueError(url), 'invalid_response'),
+        ]
+        for error, code in cases:
+            with self.subTest(code=code):
+                result = dep.provider_error(error)
+                self.assertEqual(result['errorCode'], code)
+                self.assertNotIn('secret', json.dumps(result))
+
+    def test_checks_publish_fast_result_while_other_provider_is_pending(self):
+        manager = dep.DependencyManager(self.root)
+        waiting = threading.Event()
+        release = threading.Event()
+        def latest(name):
+            if name == 'ffmpeg':
+                waiting.set()
+                if not release.wait(2):
+                    raise TimeoutError('Test release was not signaled.')
+            return {'gifski': '1.34.0', 'ffmpeg': '8.0.1'}[name]
+        with patch.object(manager, '_latest_release', side_effect=latest):
+            worker = threading.Thread(target=manager._check_worker)
+            worker.start()
+            try:
+                self.assertTrue(waiting.wait(2))
+                # The Gifski worker may be scheduled just after FFmpeg. Join
+                # only that worker so the assertion never depends on a sleep.
+                for child in threading.enumerate():
+                    if child.name == 'check-gifski':
+                        child.join(2)
+                status = manager.status()['updates']
+                self.assertEqual(status['state'], 'checking')
+                self.assertEqual(status['tools']['gifski']['latestVersion'], '1.34.0')
+                self.assertNotEqual(status['tools']['gifski']['state'], 'checking')
+                self.assertEqual(status['tools']['ffmpeg']['state'], 'checking')
+            finally:
+                release.set()
+                worker.join(2)
+        self.assertEqual(manager.status()['updates']['state'], 'completed')
+
+    def test_setup_only_queues_missing_tools_and_preserves_available_tools(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        installed = {name: {'available': True, 'path': '/existing/' + name} for name in ('gifski', 'ffmpeg', 'ffprobe')}
+        with patch.object(dep.threading, 'Thread') as thread:
+            ready = manager.install_missing(installed)
+            thread.assert_not_called()
+        self.assertEqual(ready['setup']['state'], 'completed')
+        self.assertEqual(ready['missing'], [])
+        self.assertFalse((self.root / 'bin').exists())
+        installed['ffprobe']['available'] = False
+        with patch.object(dep.threading, 'Thread') as thread:
+            status = manager.install_missing(installed)
+        self.assertTrue(status['busy'])
+        self.assertEqual(status['setup']['remaining'], ['ffmpeg'])
+        self.assertEqual(status['tools']['gifski']['state'], 'idle')
+        self.assertTrue(status['tools']['gifski']['available'])
+        self.assertEqual(status['tools']['ffmpeg']['state'], 'queued')
+        self.assertEqual(thread.call_args.kwargs['args'], (['ffmpeg'],))
+        with self.assertRaises(ValueError):
+            manager.install('gifski')
+        with self.assertRaises(ValueError):
+            manager.install_missing(installed)
+
+    def test_setup_runs_sequentially_and_reports_partial_failure(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        with patch.object(dep.threading, 'Thread'):
+            manager.install_missing({})
+        calls = []
+        def install(name):
+            calls.append(name)
+            state = manager.status()
+            self.assertTrue(state['busy'])
+            self.assertEqual(state['tools'][name]['state'], 'installing')
+            if name == 'gifski':
+                self.assertEqual(state['tools']['ffmpeg']['state'], 'queued')
+            manager._update(name, state='failed' if name == 'gifski' else 'completed')
+        with patch.object(manager, '_install_worker', side_effect=install):
+            manager._install_missing_worker(['gifski', 'ffmpeg'])
+        self.assertEqual(calls, ['gifski', 'ffmpeg'])
+        self.assertEqual(manager.status()['setup']['state'], 'partial')
+        self.assertFalse(manager.status()['busy'])
+
+    def test_setup_start_failure_and_unsupported_platform_leave_no_busy_state(self):
+        manager = dep.DependencyManager(self.root); manager.supported = False
+        with self.assertRaises(ValueError):
+            manager.install_missing({})
+        manager.supported = True
+        with patch.object(dep.threading, 'Thread', side_effect=RuntimeError('cannot start')):
+            status = manager.install_missing({})
+        self.assertFalse(status['busy'])
+        self.assertEqual(status['setup']['state'], 'failed')
+        self.assertTrue(all(tool['state'] == 'failed' for tool in status['tools'].values()))
 
     def test_changed_local_version_is_compared_against_cached_release(self):
         manager = dep.DependencyManager(self.root)

@@ -13,8 +13,8 @@ Audited against the published Gifski 1.34.0 command-line source. The app checks 
 | `--quality`, `-Q` | Integer 1–100; 90 | Overall quality |
 | `--motion-quality` | Integer 1–100; inherits quality | Temporal detail |
 | `--lossy-quality` | Integer 1–100; inherits quality | Lossy compression |
-| `--fast` | Boolean; off | Faster encoding |
-| `--extra` | Boolean; off | Additional effort; conflicts with fast |
+| `--fast` | Boolean; off | Fast effort mode |
+| `--extra` | Boolean; off | Extra effort mode; conflicts with fast |
 | `--width`, `-W` | Unsigned integer | Maximum width |
 | `--height`, `-H` | Unsigned integer | Maximum height |
 | `--repeat` | -1 / 0 / 1–32767; 0 | Once / indefinitely / repeats |
@@ -28,6 +28,8 @@ Audited against the published Gifski 1.34.0 command-line source. The app checks 
 | `--version`, `-V` | Flag | Version |
 
 *Direct conventional video decoding requires Gifski's optional video build feature. Using the separate FFmpeg executable removes this requirement. PNG input requires multiple images. Fixed colors accept space/comma lists and repeated flags. Long help includes options omitted from short help.
+
+Normal, Fast, and Extra are the three CLI effort modes: Normal omits both effort flags. The UI’s Smart search effort is a separate candidate-search budget, not another Gifski effort level.
 
 ## Behavior that affects results
 
@@ -60,12 +62,17 @@ Gifski's CLI has no independent dithering-strength, palette-count, thread-count,
 
 ## WebUI decision tools
 
-- **Preset flow:** Default, Smart, Discord, Other presets, Custom, and Advanced share one selector on the Create screen. Advanced groups the complete CLI inventory; History and Settings are secondary views. No separate Compare or Fit a size tabs.
+- **Workspace:** Default, Smart, Discord, Other presets, Custom, and Advanced share the left-hand controls. Process status, logs, results, and history stay in the right column; Settings opens a dialog. The fixed footer holds output/estimate summaries and the encode action. The layout stacks on smaller screens. There are no Create, History, Compare, or Fit a size navigation tabs.
 - **Source matching:** width/height/FPS and trim-end controls can follow probed values. Matching a dimension clears the other dimension to preserve aspect ratio. FPS matching caps at 50 FPS.
-- **Size estimate:** full measurement for clips up to two seconds; three separated samples of about half a second for longer clips (at least four frames each). Displays a heuristic range and marks estimates stale after changes. Unchanged recipes reuse a five-minute memory cache keyed by settings, source metadata, and executables. Samples are never counted as verified exports. Unknown duration needs a trim end; long native-direct input requires preprocessing to sample.
+- **Size estimate:** full measurement for clips up to two seconds; three separated samples of about half a second for longer clips (at least four frames each). Shows a heuristic range in expandable footer details, labels cached/stale/calculating/error states, and does not scroll to a separate estimate panel. Unchanged recipes reuse a five-minute memory cache keyed by settings, source metadata, and executables. Samples are never counted as verified exports. Unknown duration needs a trim end; long native-direct input requires preprocessing to sample.
 - **Smart and Discord:** share an adaptive search. Smart takes a decimal MB limit; Discord fixes it at 20,000,000 bytes. Start at source dimensions (up to a 16-megapixel safety bound) and source timing (up to 50 FPS), preserving aspect ratio. Probe quality, width, and FPS separately to estimate their size impact; screen promising combinations before complete verification. Effort budgets are Quick (5 sample recipes / 4 full encodes), Balanced (9 / 8), and Thorough (15 / 12); each can stop earlier. Thorough can test Extra encoder effort on a fitting result. Sample recipes each use up to three short encodes.
 - **Ranking:** width retention has weight 0.75 and FPS retention 0.30; quality uses a diminishing-return curve near 100. Extra receives a small preference bonus when its full output fits. A predicted gain below 0.8% can stop refinement. This is a documented settings preference, not a measured perceptual metric or an exhaustive optimum. Source, chosen trim, crop, image filters, and playback remain intact; the search never silently trims to meet a limit.
 - **Verification and resources:** only full outputs at or below the exact byte limit qualify. The best verified candidate is kept on cancellation; no-fit is explicit. Compatible PNG preprocessing is reused within a job, capped at 512 MiB cached / 256 MiB per entry, then removed. Extraction rejects more than 100,000 frames rather than returning a truncated export.
-- **Setup and updates:** dependency-only onboarding detects existing tools and offers executable-path selection. Windows x64 portable installation uses fixed providers, SHA-256 checks, and the local app folder. Python must already be installed. Explicit version checks compare active executables with official upstream stable releases, cache results for 15 minutes, and identify uncertain custom/nightly versions. Installs and path changes cannot overlap active exports.
+- **Live process feedback:** stage progress, elapsed time, and available frame/FPS/speed information. Structured FFmpeg progress and meaningful Gifski PNG frame counts drive percentages; unknown progress stays indeterminate. Carriage-return console output is handled continuously. Bounded logs include process start/exit and periodic keepalives even in quiet mode; follow-log can be disabled. Cancel terminates tracked processes with kill escalation. Long gaps in output produce a diagnostic, not a fabricated failure.
+- **Efficient updates:** compact history summaries plus selected-job details, non-overlapping requests with deadlines, slower hidden-page polling, visible reconnect feedback, and stable history nodes/log scroll. A pending estimate can continue updating the footer while another job is inspected.
+- **CPU and hardware:** Advanced offers FFmpeg threads `0–256` and CPU or automatic hardware video decoding. Zero keeps decoder selection automatic and bounds filter/PNG workers to eight or the logical CPU count, whichever is lower. Explicit thread requests apply to FFmpeg decoding, filters, and PNG preparation. Hardware decoding is optional and can retry on the CPU; filters and Gifski remain CPU work. Gifski manages its own threading. FFmpeg controls have no effect in Direct mode.
+- **Browser enhancement:** an optional screen wake lock during active jobs, only while visible and supported. Disabled or rejected wake lock does not block encoding; it is not a system-suspend guarantee.
+- **Dependency setup:** explicit paths override automatic detection; otherwise PATH precedes the app-local copy. FFprobe can also be found beside configured FFmpeg. Active versions, paths, and detection origins are visible. Windows x64 **Set up missing tools** checks existing executables and downloads only missing dependencies into `bin/`, with fixed providers and SHA-256 checks. Downloads require an install action. Existing PATH tools are retained; Python must already be installed. Installs and path changes cannot overlap active exports.
+- **Version checks:** on-demand comparison of active executables against upstream release metadata, a 15-minute successful-result cache, and uncertain states for custom/nightly builds. Gifski’s API can fall back to its official release page; FFmpeg’s archive can fall back to stable tags from its official mirror. Provider results arrive independently. The UI reports the source used and specific connection, certificate, proxy, rate-limit, access, timeout, or metadata errors. A portable update does not override a working PATH executable or explicit path.
 
 The older sweep/optimize API modes remain readable for existing history and integrations; they have no separate interface workspace. See [DESIGN.md](DESIGN.md) for the layout philosophy and boundaries.

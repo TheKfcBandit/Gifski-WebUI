@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
 import shutil
+import socket
+import ssl
 import stat
 import struct
 import subprocess
@@ -20,13 +23,16 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 
 GITHUB_RELEASE = 'https://api.github.com/repos/ImageOptim/gifski/releases/latest'
+GIFSKI_RELEASE_PAGE = 'https://github.com/ImageOptim/gifski/releases/latest'
 FFMPEG_URL = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
 FFMPEG_RELEASES = 'https://ffmpeg.org/releases/'
+FFMPEG_TAGS = 'https://api.github.com/repos/FFmpeg/FFmpeg/tags?per_page=100'
 UPDATE_CACHE_SECONDS = 15 * 60
 MAX_LICENSE_BYTES = 4 * 1024 * 1024
 MAX_ARCHIVE = 512 * 1024 * 1024
@@ -55,7 +61,7 @@ class TrustedRedirect(urllib.request.HTTPRedirectHandler):
 def _open(url, timeout=30):
     validate_url(url)
     request = urllib.request.Request(url, headers={
-        'User-Agent': 'Gifski-WebUI/1.1', 'Accept': 'application/vnd.github+json' if 'api.github.com' in url else '*/*',
+        'User-Agent': 'Gifski-WebUI', 'Accept': 'application/vnd.github+json' if 'api.github.com' in url else '*/*',
     })
     response = urllib.request.build_opener(TrustedRedirect()).open(request, timeout=timeout)
     validate_url(response.geturl())
@@ -63,18 +69,68 @@ def _open(url, timeout=30):
 
 
 def _read_small(url, limit=2 * 1024 * 1024):
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + 16
     data = bytearray()
-    with _open(url, timeout=15) as response:
+    with _open(url, timeout=8) as response:
         read = getattr(response, 'read1', response.read)
         while len(data) <= limit:
             if time.monotonic() > deadline:
-                raise ValueError('The provider metadata request timed out.')
+                raise TimeoutError('The provider metadata request timed out.')
             block = read(min(65536, limit + 1 - len(data)))
             if not block:
                 return bytes(data)
             data.extend(block)
     raise ValueError('Provider metadata exceeded the size limit.')
+
+
+class UpdateCheckError(ValueError):
+    """Only sanitized provider diagnostics are carried into the UI."""
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def provider_error(error):
+    """Describe common network failures without exposing URLs, credentials or paths."""
+    if isinstance(error, UpdateCheckError):
+        return {'errorCode': error.code, 'message': str(error)}
+    if isinstance(error, urllib.error.HTTPError):
+        headers = error.headers or {}
+        if error.code == 429 or (error.code == 403 and headers.get('X-RateLimit-Remaining') == '0'):
+            return {'errorCode': 'rate_limited', 'message': 'The provider rate limit was reached. Wait a few minutes, then retry.'}
+        if error.code == 407:
+            return {'errorCode': 'proxy', 'message': 'Your proxy requires authentication. Check the system proxy configuration.'}
+        if error.code in (401, 403):
+            return {'errorCode': 'access_denied', 'message': 'The provider denied this request. Check firewall or proxy access to the release source.'}
+        if error.code >= 500:
+            return {'errorCode': 'provider_unavailable', 'message': f'The release source returned HTTP {error.code}. Try again later.'}
+        return {'errorCode': 'http_error', 'message': f'The release source returned HTTP {error.code}. Open its release page or retry later.'}
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError) or 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+        return {'errorCode': 'certificate', 'message': 'HTTPS certificate verification failed. Check your clock, Python certificates, and any HTTPS-inspecting proxy.'}
+    if isinstance(reason, ssl.SSLError):
+        return {'errorCode': 'tls', 'message': 'The secure connection failed. Check Python updates and your proxy or firewall.'}
+    if isinstance(reason, socket.gaierror):
+        return {'errorCode': 'dns', 'message': 'The release host could not be found. Check your connection, DNS, or proxy settings.'}
+    if isinstance(reason, (TimeoutError, socket.timeout)) or 'timed out' in str(reason).lower():
+        return {'errorCode': 'timeout', 'message': 'The release source timed out. Check your connection or retry later.'}
+    if isinstance(error, (ValueError, TypeError, KeyError)):
+        return {'errorCode': 'invalid_response', 'message': 'The release source returned unrecognized metadata. Open its release page or retry later.'}
+    return {'errorCode': 'network', 'message': 'Could not reach the release source. Check your connection, proxy, and firewall settings.'}
+
+
+class ReleasePageParser(HTMLParser):
+    """Read only canonical page identity, never arbitrary linked release tags."""
+    def __init__(self):
+        super().__init__()
+        self.urls = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == 'meta' and attrs.get('property') == 'og:url':
+            self.urls.append(attrs.get('content', ''))
+        elif tag == 'link' and attrs.get('rel') == 'canonical':
+            self.urls.append(attrs.get('href', ''))
 
 
 def checksum(text):
@@ -194,11 +250,14 @@ class DependencyManager:
         self.lock = threading.RLock()
         self.release_cache = {}
         self.release_errors = {}
+        self.release_sources = {}
+        self.check_pending = set()
         self.checked_at = None
         self.checked_monotonic = None
         self.check_state = 'idle'
         self.check_cached = False
         self.installed_tools = {}
+        self.setup = {'state': 'idle', 'remaining': [], 'message': ''}
         self.supported = platform.system() == 'Windows' and platform.machine().lower() in ('amd64', 'x86_64')
         self.tools = {name: {'state': 'idle', 'progress': 0, 'message': '', 'error': None,
                              'version': '', 'sourceUrl': source}
@@ -211,12 +270,16 @@ class DependencyManager:
             if installed_tools is not None:
                 self.installed_tools = copy.deepcopy(installed_tools)
             updates = self._update_status()
+            setup = copy.deepcopy(self.setup)
+            installed = copy.deepcopy(self.installed_tools)
         for name, item in tools.items():
             wanted = [name] if name == 'gifski' else ['ffmpeg', 'ffprobe']
             item['installed'] = all((self.root / 'bin' / f'{tool}.exe').is_file() for tool in wanted)
+            item['available'] = all(installed.get(tool, {}).get('available', False) for tool in wanted)
         return {'platform': f'{platform.system()} {platform.machine()}', 'supported': self.supported,
-                'busy': any(t['state'] == 'installing' for t in tools.values()),
-                'tools': tools, 'updates': updates, 'destination': 'bin/',
+                'busy': setup['state'] == 'installing' or any(t['state'] in ('queued', 'installing') for t in tools.values()),
+                'tools': tools, 'updates': updates, 'setup': setup, 'destination': 'bin/',
+                'missing': [name for name in ('gifski', 'ffmpeg', 'ffprobe') if not installed.get(name, {}).get('available', False)],
                 'manual': {'gifski': 'Install Gifski from its official releases, or run brew install gifski on macOS. Then select its path in Engine settings.',
                            'ffmpeg': 'Install FFmpeg and FFprobe with your OS package manager, or select existing executable paths in Engine settings.'}}
 
@@ -233,14 +296,15 @@ class DependencyManager:
             version = str(local.get('version') or '')[:240]
             latest = self.release_cache.get(upstream, '')
             item = {'state': 'not_checked', 'installedVersion': version,
-                    'latestVersion': latest,
+                    'latestVersion': latest, 'errorCode': None, 'sourceUsed': '',
                     'sourceUrl': ('https://github.com/ImageOptim/gifski/releases' if upstream == 'gifski'
                                   else 'https://ffmpeg.org/download.html'),
                     'message': 'Check updates to compare with the latest upstream release.'}
-            if self.check_state == 'checking':
+            item.update(self.release_sources.get(upstream, {}))
+            if upstream in self.check_pending:
                 item.update(state='checking', message='Checking the official release source…')
             elif upstream in self.release_errors:
-                item.update(state='error', message=self.release_errors[upstream])
+                item.update(state='error', **self.release_errors[upstream])
             elif latest:
                 local_version, vendor = installed_version(name, version)
                 remote_version = release_version(latest)
@@ -274,41 +338,121 @@ class DependencyManager:
                 return self.status()
             self.check_state = 'checking'
             self.check_cached = False
+            self.check_pending = {'gifski', 'ffmpeg'}
+            self.release_cache = {}
+            self.release_errors = {}
+            self.release_sources = {}
         try:
             threading.Thread(target=self._check_worker, daemon=True, name='check-updates').start()
         except RuntimeError:
             with self.lock:
                 self.check_state = 'failed'
-                self.release_errors = {tool: 'Could not start the update check. Try again.' for tool in ('gifski', 'ffmpeg')}
+                self.check_pending.clear()
+                self.release_errors = {tool: {'errorCode': 'startup', 'message': 'Could not start the update check. Try again.'}
+                                       for tool in ('gifski', 'ffmpeg')}
         return self.status()
 
     def _latest_release(self, tool):
-        if tool == 'gifski':
-            release = json.loads(_read_small(GITHUB_RELEASE))
-            version = str(release.get('tag_name', '')).removeprefix('v')
-            if release.get('draft') or release.get('prerelease') or release_version(version) is None:
-                raise ValueError('The provider did not return a stable Gifski release.')
-            return version
-        page = _read_small(FFMPEG_RELEASES).decode('utf-8', errors='replace')
+        sources = ((GITHUB_RELEASE, 'GitHub release API', self._gifski_api),
+                   (GIFSKI_RELEASE_PAGE, 'Gifski release page', self._gifski_page)) if tool == 'gifski' else (
+                   (FFMPEG_RELEASES, 'FFmpeg release archive', self._ffmpeg_archive),
+                   (FFMPEG_TAGS, 'FFmpeg release tags (official mirror)', self._ffmpeg_tags))
+        failures = []
+        for url, label, parse in sources:
+            try:
+                version = parse(_read_small(url))
+                with self.lock:
+                    self.release_sources[tool] = {'sourceUsed': label, 'sourceUrl': (
+                        'https://github.com/FFmpeg/FFmpeg/tags' if url == FFMPEG_TAGS else url)}
+                return version
+            except Exception as error:
+                failures.append((label, provider_error(error)))
+        message = ' '.join(f'{label}: {error["message"]}' for label, error in failures)
+        raise UpdateCheckError(failures[0][1]['errorCode'], message)
+
+    @staticmethod
+    def _gifski_api(data):
+        release = json.loads(data)
+        if not isinstance(release, dict):
+            raise ValueError('Invalid release metadata.')
+        version = str(release.get('tag_name', '')).removeprefix('v')
+        if release.get('draft') or release.get('prerelease') or release_version(version) is None:
+            raise ValueError('The provider did not return a stable Gifski release.')
+        return version
+
+    @staticmethod
+    def _gifski_page(data):
+        page = ReleasePageParser()
+        page.feed(data.decode('utf-8', errors='replace'))
+        for value in page.urls:
+            url = urllib.parse.urlsplit(urllib.parse.urljoin(GIFSKI_RELEASE_PAGE, value))
+            if url.scheme != 'https' or url.netloc != 'github.com':
+                continue
+            match = re.fullmatch(r'/ImageOptim/gifski/releases/tag/(v?\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)', url.path)
+            if match and release_version(match[1]):
+                return match[1].removeprefix('v')
+        raise ValueError('The Gifski release page could not be understood.')
+
+    @staticmethod
+    def _ffmpeg_archive(data):
+        page = data.decode('utf-8', errors='replace')
         versions = set(re.findall(r'href=[\"\']ffmpeg-(\d{1,4}\.\d{1,4}(?:\.\d{1,4})?)\.tar\.xz[\"\']', page))
         if not versions:
             raise ValueError('The FFmpeg release listing could not be understood.')
         return max(versions, key=release_version)
 
+    @staticmethod
+    def _ffmpeg_tags(data):
+        # FFmpeg identifies stable releases with nX.Y[.Z] tags. GitHub's
+        # release section is not current; only the official mirror tags apply.
+        tags = json.loads(data)
+        if not isinstance(tags, list):
+            raise ValueError('Invalid FFmpeg tag metadata.')
+        versions = [tag['name'][1:] for tag in tags if isinstance(tag, dict)
+                    and isinstance(tag.get('name'), str) and tag['name'].startswith('n')
+                    and release_version(tag['name'][1:])]
+        if not versions:
+            raise ValueError('No stable FFmpeg release tags were found.')
+        return max(versions, key=release_version)
+
     def _check_worker(self):
-        # Isolate provider failures so one outage does not hide the other result.
-        releases, errors = {}, {}
+        # Publish each independent result immediately. A slow source must not
+        # hide another tool's version or make checks take the sum of timeouts.
+        with self.lock:
+            self.check_state = 'checking'
+            self.check_pending = {'gifski', 'ffmpeg'}
+            self.release_cache = {}
+            self.release_errors = {}
+            self.release_sources = {}
+
+        def check(name):
+            try:
+                version = self._latest_release(name)
+                with self.lock:
+                    self.release_cache[name] = version
+            except Exception as error:
+                with self.lock:
+                    self.release_errors[name] = provider_error(error)
+            finally:
+                with self.lock:
+                    self.check_pending.discard(name)
+
+        workers = []
         for name in ('gifski', 'ffmpeg'):
             try:
-                releases[name] = self._latest_release(name)
-            except Exception:
-                errors[name] = 'Could not check the official release source. Try again later or open its release page.'
+                worker = threading.Thread(target=check, args=(name,), daemon=True, name=f'check-{name}')
+                worker.start()
+                workers.append(worker)
+            except RuntimeError:
+                with self.lock:
+                    self.release_errors[name] = {'errorCode': 'startup', 'message': 'Could not start this update check. Try again.'}
+                    self.check_pending.discard(name)
+        for worker in workers:
+            worker.join()
         with self.lock:
-            self.release_cache = releases
-            self.release_errors = errors
             self.checked_at = time.time()
             self.checked_monotonic = time.monotonic()
-            self.check_state = 'completed' if not errors else ('partial' if releases else 'failed')
+            self.check_state = 'completed' if not self.release_errors else ('partial' if self.release_cache else 'failed')
 
     def install(self, tool):
         if tool not in self.tools:
@@ -316,7 +460,7 @@ class DependencyManager:
         if not self.supported:
             raise ValueError('Automatic portable installation is available for Windows x64. Use the manual instructions on this platform.')
         with self.lock:
-            if any(t['state'] == 'installing' for t in self.tools.values()):
+            if self.setup['state'] == 'installing' or any(t['state'] in ('queued', 'installing') for t in self.tools.values()):
                 raise ValueError('A dependency installation is already running.')
             self.tools[tool].update(state='installing', progress=0, error=None, message='Checking the provider release…')
         try:
@@ -324,6 +468,46 @@ class DependencyManager:
         except RuntimeError:
             self._update(tool, state='failed', error='Could not start installation. Try again.', message='Installation did not start.')
         return self.status()
+
+    def install_missing(self, installed_tools):
+        """Explicit setup action: install only absent tools, into this app's bin/."""
+        if not self.supported:
+            raise ValueError('Automatic portable installation is available for Windows x64. Use the manual instructions on this platform.')
+        with self.lock:
+            if self.setup['state'] == 'installing' or any(t['state'] in ('queued', 'installing') for t in self.tools.values()):
+                raise ValueError('A dependency installation is already running.')
+            self.installed_tools = copy.deepcopy(installed_tools)
+            queue = []
+            if not installed_tools.get('gifski', {}).get('available'):
+                queue.append('gifski')
+            if not all(installed_tools.get(name, {}).get('available') for name in ('ffmpeg', 'ffprobe')):
+                queue.append('ffmpeg')
+            self.setup = {'state': 'installing' if queue else 'completed', 'remaining': list(queue),
+                          'message': 'Installing missing tools into bin/…' if queue else 'All required tools are already available.'}
+            for name in queue:
+                self.tools[name].update(state='queued', progress=0, error=None, message='Waiting to install locally…')
+        if queue:
+            try:
+                threading.Thread(target=self._install_missing_worker, args=(queue,), daemon=True, name='setup-dependencies').start()
+            except RuntimeError:
+                with self.lock:
+                    for name in queue:
+                        self.tools[name].update(state='failed', error='Could not start installation. Try again.', message='Installation did not start.')
+                    self.setup.update(state='failed', remaining=[], message='Could not start setup. Try again.')
+        return self.status()
+
+    def _install_missing_worker(self, queue):
+        for name in queue:
+            self._update(name, state='installing', message='Checking the provider release…')
+            self._install_worker(name)
+            with self.lock:
+                self.setup['remaining'] = [tool for tool in self.setup['remaining'] if tool != name]
+        with self.lock:
+            succeeded = sum(self.tools[name]['state'] == 'completed' for name in queue)
+            state = 'completed' if succeeded == len(queue) else ('partial' if succeeded else 'failed')
+            message = ('Missing tools were installed locally. Existing PATH and configured tools keep priority.' if state == 'completed'
+                       else 'Some tools could not be installed. Review the tool messages and retry setup.')
+            self.setup.update(state=state, remaining=[], message=message)
 
     def _metadata(self, tool):
         if tool == 'ffmpeg':
@@ -438,8 +622,8 @@ class DependencyManager:
                 self.on_change()
         except Exception as error:
             # Avoid returning signed redirect URLs from urllib errors.
-            if isinstance(error, urllib.error.URLError):
-                message = 'Could not download from the dependency provider. Check the connection or install manually.'
+            if isinstance(error, (urllib.error.URLError, ssl.SSLError, TimeoutError, socket.gaierror)):
+                message = provider_error(error)['message']
             else:
                 message = str(error)
             self._update(tool, state='failed', error=message, message='Installation failed. Existing executable paths are unchanged.')

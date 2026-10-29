@@ -2,8 +2,13 @@
 import base64
 import copy
 import json
+import io
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -24,6 +29,231 @@ class EngineTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def process_job(self, jid='process'):
+        self.engine.jobs[jid] = {'id': jid, 'status': 'running', 'mode': 'encode', 'created': time.time(),
+                                 'stage': 'Testing', 'logs': [], 'commands': [], 'results': []}
+        return self.engine.jobs[jid]
+
+    def test_performance_flags_are_scoped_and_validated(self):
+        plan = self.engine.plan(dict(self.settings, performance={'threads': 4, 'hardwareDecode': 'auto'}))
+        command = plan['commands'][0]
+        self.assertEqual(command[command.index('-hwaccel') + 1], 'auto')
+        self.assertEqual(command[command.index('-filter_threads') + 1], '4')
+        self.assertEqual(command.count('-threads'), 2)
+        self.assertEqual(command[command.index('-progress') + 1], 'pipe:2')
+        self.assertNotIn('-hwaccel', plan['commands'][1])
+        for values in ({'threads': -1}, {'threads': 257}, {'threads': True}, {'threads': 2.5}, {'hardwareDecode': 'cuda'}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.engine.plan(dict(self.settings, performance=values))
+
+    def test_history_summary_omits_large_and_private_source_fields(self):
+        job = self.process_job()
+        job.update(settings={'source': {'path': r'C:\\private\\source.mp4', 'paths': ['private'] * 10000}},
+                   logs=['large'] * 250, results=[{'settings': {'large': True}}])
+        item = self.engine.list_job_summaries()[0]
+        self.assertEqual(item['sourceName'], 'source.mp4')
+        self.assertEqual(item['resultCount'], 1)
+        for key in ('settings', 'logs', 'results', 'commands'):
+            self.assertNotIn(key, item)
+        self.assertTrue(self.engine.has_active_jobs())
+        job['status'] = 'completed'
+        self.assertFalse(self.engine.has_active_jobs())
+
+    def test_configuration_validation_is_atomic(self):
+        previous = dict(self.engine.config)
+        with self.assertRaises(ValueError):
+            self.engine.configure({'gifski': 'changed', 'ffmpeg': 123})
+        self.assertEqual(previous, self.engine.config)
+        self.assertFalse(self.engine.config_path.exists())
+
+    def test_working_path_precedes_portable_and_invalid_override_stays_explicit(self):
+        local = self.root / 'bin' / 'ffmpeg'
+        local.parent.mkdir()
+        local.write_bytes(b'fake')
+        def run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 1 if command[0] == 'broken' else 0, 'version 1', '')
+        with patch('engine.shutil.which', side_effect=lambda name: '/system/' + name if name != 'broken' else None), patch('engine.subprocess.run', side_effect=run):
+            self.assertEqual(self.engine.status()['tools']['ffmpeg']['path'], '/system/ffmpeg')
+            self.assertEqual(self.engine._tool('ffmpeg'), '/system/ffmpeg')
+            status = self.engine.configure({'ffmpeg': 'broken'})
+            self.assertFalse(status['tools']['ffmpeg']['available'])
+            self.assertEqual(status['tools']['ffmpeg']['path'], 'broken')
+        self.engine.config = {}
+        self.engine.invalidate_status()
+        def broken_path(command, **kwargs):
+            return subprocess.CompletedProcess(command, 1 if command[0] == '/system/ffmpeg' else 0, 'version 2', '')
+        with patch('engine.shutil.which', side_effect=lambda name: '/system/' + name), patch('engine.subprocess.run', side_effect=broken_path):
+            self.assertEqual(self.engine.status()['tools']['ffmpeg']['path'], str(local))
+            self.assertEqual(self.engine._tool('ffmpeg'), str(local))
+
+    def test_status_concurrent_requests_share_one_probe_batch(self):
+        entered, release = threading.Event(), threading.Event()
+        calls, results = [], []
+        def run(command, **kwargs):
+            calls.append(command)
+            entered.set()
+            release.wait(2)
+            return subprocess.CompletedProcess(command, 0, 'version 1', '')
+        with patch('engine.subprocess.run', side_effect=run):
+            threads = [threading.Thread(target=lambda: results.append(self.engine.status())) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            self.assertTrue(entered.wait(1))
+            release.set()
+            for thread in threads:
+                thread.join(3)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(calls), 4)  # Three versions and Gifski help, not two batches.
+        self.assertEqual(results[0], results[1])
+
+    def test_ffmpeg_progress_is_structured_and_ignores_nonfinite_numbers(self):
+        self.process_job()
+        record = {'lastOutputAt': 0, 'expectedSeconds': 4, 'frame': None, 'fps': None,
+                  'speed': None, 'outTimeSeconds': None, 'percent': None}
+        output = io.BytesIO(b'frame=40\nfps=20.0\nout_time_us=2000000\nspeed=1.5x\nprogress=continue\nfps=nan\n')
+        self.engine._read_output('process', output, 'FFmpeg', record, [], ffmpeg=True)
+        self.assertEqual((record['frame'], record['fps'], record['speed'], record['percent']), (40, 20, '1.5x', 50))
+        self.assertEqual(self.engine.jobs['process']['logs'], [])
+
+    def test_invalidation_during_probe_does_not_cache_stale_selection(self):
+        entered, release = threading.Event(), threading.Event()
+        def run(command, **kwargs):
+            entered.set()
+            release.wait(2)
+            return subprocess.CompletedProcess(command, 0, 'version 1', '')
+        with patch('engine.subprocess.run', side_effect=run):
+            thread = threading.Thread(target=self.engine.status)
+            thread.start()
+            self.assertTrue(entered.wait(1))
+            self.engine.invalidate_status()
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(self.engine._status)
+        self.assertEqual(self.engine._resolved_tools, {})
+
+    def test_encoder_redraws_update_frames_without_flooding_log(self):
+        job = self.process_job()
+        record = {'lastOutputAt': 0}
+        text = b''.join(f'Frame {i} / 100 ###\r'.encode() for i in range(1, 101))
+        self.engine._read_output('process', io.BytesIO(text), 'Gifski', record, [], frame_progress=True)
+        self.assertEqual(record['frame'], 100)
+        self.assertEqual(record['totalFrames'], 100)
+        self.assertEqual(record['percent'], 99.9)  # Exit status verifies completion.
+        self.assertLess(len(job['logs']), 5)
+
+    def test_carriage_return_output_is_visible_before_child_exits_and_bounded(self):
+        job = self.process_job()
+        errors = []
+        command = [sys.executable, '-u', '-c',
+                   "import os,time; os.write(2,b'\\x1b[32mfirst progress\\x1b[0m\\r'); time.sleep(.6); os.write(2,b'x'*20000+b'\\rfinished\\n')"]
+        def execute():
+            try:
+                self.engine._run('process', command)
+            except Exception as error:
+                errors.append(error)
+        thread = threading.Thread(target=execute)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not any('first progress' in line for line in job['logs']):
+            time.sleep(.01)
+        self.assertTrue(thread.is_alive(), 'CR progress should appear while child is still running')
+        thread.join(4)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(errors)
+        self.assertTrue(any('first progress' in line for line in job['logs']))
+        self.assertTrue(all('\x1b' not in line and len(line) <= 4011 for line in job['logs']))
+        self.assertEqual(job['process']['status'], 'completed')
+        self.assertFalse(self.engine.active['process'])
+
+    def test_failed_pipe_producer_terminates_waiting_consumer(self):
+        self.process_job()
+        producer = [sys.executable, '-c', 'import sys; sys.exit(7)']
+        consumer = [sys.executable, '-c', 'import sys,time; sys.stdin.buffer.read(); time.sleep(15)']
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'FFmpeg 7'):
+            self.engine._run_pipe('process', producer, consumer)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(self.engine.active['process'])
+
+    def test_pipe_consumer_spawn_failure_reaps_producer(self):
+        self.process_job()
+        producer = [sys.executable, '-c', 'import time; time.sleep(15)']
+        with self.assertRaises(OSError):
+            self.engine._run_pipe('process', producer, [str(self.root / 'missing-program')])
+        self.assertFalse(self.engine.active['process'])
+
+    def test_running_child_cancellation_reaps_process(self):
+        job = self.process_job()
+        timer = threading.Timer(.2, lambda: self.engine.cancel('process'))
+        timer.start()
+        try:
+            with self.assertRaises(Cancelled):
+                self.engine._run('process', [sys.executable, '-c', 'import time; time.sleep(15)'])
+        finally:
+            timer.cancel()
+        self.assertEqual(job['process']['status'], 'cancelled')
+        self.assertFalse(self.engine.active['process'])
+
+    def test_job_probe_cancellation_reaps_sleeping_child_and_closes_pipes(self):
+        job = self.process_job()
+        spawn = subprocess.Popen
+        children = []
+        def start_probe(command, **kwargs):
+            child = spawn([sys.executable, '-u', '-c', 'import time; time.sleep(15)'], **kwargs)
+            children.append(child)
+            return child
+        timer = threading.Timer(.2, lambda: self.engine.cancel('process'))
+        started = time.monotonic()
+        timer.start()
+        try:
+            with patch('engine.subprocess.Popen', side_effect=start_probe), self.assertRaises(Cancelled):
+                self.engine.probe(self.settings['source'], jid='process')
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(job['process']['status'], 'cancelled')
+        self.assertFalse(self.engine.active['process'])
+        self.assertIsNotNone(children[0].poll())
+        self.assertTrue(children[0].stdout.closed)
+        self.assertTrue(children[0].stderr.closed)
+
+    def test_probe_capture_retains_json_across_poll_timeouts_without_logging_it(self):
+        job = self.process_job()
+        command = [sys.executable, '-u', '-c',
+                   "import sys,time; sys.stdout.write('{'); sys.stdout.flush(); time.sleep(.25); print('\\\"streams\\\":[]}')"]
+        result = self.engine._capture_probe('process', command)
+        self.assertEqual(json.loads(result.stdout), {'streams': []})
+        self.assertFalse(any('streams' in line for line in job['logs']))
+        self.assertFalse(self.engine.active['process'])
+
+    def test_probe_timeout_reaps_child(self):
+        job = self.process_job()
+        command = [sys.executable, '-c', 'import time; time.sleep(15)']
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.engine._capture_probe('process', command, timeout=.15)
+        self.assertEqual(job['process']['status'], 'failed')
+        self.assertFalse(self.engine.active['process'])
+
+    def test_hardware_retry_cleans_partial_frames_and_is_reused(self):
+        self.process_job()
+        frames = self.root / 'frames'
+        frames.mkdir()
+        partial = frames / 'f000000.png'
+        partial.write_bytes(b'partial')
+        command = ['ffmpeg', '-hwaccel', 'auto', '-i', 'source', 'output']
+        calls = []
+        def execute(jid, args):
+            calls.append(args)
+            if '-hwaccel' in args:
+                raise RuntimeError('decode failed')
+            self.assertFalse(partial.exists())
+        with patch.object(self.engine, '_run', side_effect=execute):
+            self.engine._run_ffmpeg('process', command, frames=frames)
+            self.engine._run_ffmpeg('process', command, frames=frames)
+        self.assertEqual(sum('-hwaccel' in cmd for cmd in calls), 1)
+        self.assertTrue(self.engine.jobs['process']['hardwareDecodeFallback'])
 
     def test_complete_gifski_flags_and_safe_arguments(self):
         s = dict(self.settings, quality=73, lossyQuality=68, motionQuality=84,

@@ -46,6 +46,15 @@ class FakeEngine:
     def list_jobs(self):
         return []
 
+    def list_job_summaries(self):
+        return []
+
+    def has_active_jobs(self):
+        return False
+
+    def invalidate_status(self):
+        pass
+
     def get_job(self, job_id):
         return None
 
@@ -117,11 +126,12 @@ class HTTPTests(unittest.TestCase):
             install.assert_called_once_with('gifski')
 
     def test_update_check_contract_and_origin_guard(self):
-        with patch.object(self.http.dependencies, 'check_updates', create=True, return_value={'updates': {'state': 'checking'}}) as check:
+        with patch.object(self.http.dependencies, 'check_updates', return_value={'updates': {'state': 'checking'}}) as check, patch.object(self.engine, 'invalidate_status') as invalidate:
             code, _, data = self.json_post('/api/dependencies/check-updates', {})
             self.assertEqual(code, 202)
             self.assertEqual(json.loads(data)['updates']['state'], 'checking')
             check.assert_called_once_with({})
+            invalidate.assert_not_called()
         self.assertEqual(self.json_post('/api/dependencies/check-updates', {}, auth=False)[0], 401)
 
     def test_explicit_installed_version_refresh_invalidates_status(self):
@@ -131,12 +141,30 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.json_post('/api/status/refresh', {}, auth=False)[0], 401)
 
     def test_tool_changes_and_job_submission_do_not_overlap(self):
-        with patch.object(self.engine, 'list_jobs', return_value=[{'status': 'running'}]):
+        with patch.object(self.engine, 'has_active_jobs', return_value=True):
             self.assertEqual(self.json_post('/api/dependencies/install', {'tool': 'gifski'})[0], 409)
+            self.assertEqual(self.json_post('/api/dependencies/install-missing', {})[0], 409)
             self.assertEqual(self.json_post('/api/config', {'gifski': 'new'})[0], 409)
         with patch.object(self.http.dependencies, 'status', return_value={'busy': True}):
             self.assertEqual(self.json_post('/api/jobs', {'settings': {'source': {}}})[0], 409)
             self.assertEqual(self.json_post('/api/config', {'ffmpeg': 'new'})[0], 409)
+
+    def test_install_missing_refreshes_detection_and_requires_session(self):
+        snapshot = {'ffmpeg': {'available': True, 'origin': 'path'}}
+        with patch.object(self.engine, 'status', return_value={'tools': snapshot}), patch.object(self.engine, 'invalidate_status') as invalidate, patch.object(self.http.dependencies, 'install_missing', return_value={'busy': True}) as install:
+            self.assertEqual(self.json_post('/api/dependencies/install-missing', {})[0], 202)
+            invalidate.assert_called_once_with()
+            install.assert_called_once_with(snapshot)
+            self.assertEqual(self.json_post('/api/dependencies/install-missing', {}, auth=False)[0], 401)
+            self.assertEqual(self.json_post('/api/dependencies/install-missing', {}, headers={'Origin': 'https://untrusted.example'})[0], 403)
+            self.assertEqual(install.call_count, 1)
+
+    def test_history_summary_does_not_copy_full_jobs(self):
+        with patch.object(self.engine, 'list_job_summaries', return_value=[{'id': 'one', 'status': 'running'}]) as summaries, patch.object(self.engine, 'list_jobs', side_effect=AssertionError('Full jobs should not be loaded')):
+            code, _, data = self.request('GET', '/api/jobs?summary=1')
+            self.assertEqual(code, 200)
+            self.assertEqual(json.loads(data)['jobs'][0]['id'], 'one')
+            summaries.assert_called_once_with()
 
     def request(self, method, path, body=None, auth=True, headers=None):
         h = {'Connection': 'close'}
