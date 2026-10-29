@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import http.cookies
 import json
 import mimetypes
@@ -12,6 +13,8 @@ import re
 import secrets
 import shutil
 import socket
+import sys
+import tempfile
 import threading
 import urllib.parse
 import webbrowser
@@ -20,11 +23,35 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from engine import Engine
 from dependencies import DependencyManager
 from thumbnails import ThumbnailCache
+from presets import PresetConflict, PresetStore, PresetStoreUnavailable
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent)).resolve()
 MAX_JSON = 2 * 1024 * 1024
 MAX_UPLOAD = 20 * 1024 ** 3
 MEDIA = {'.mp4', '.m4v', '.webm', '.mov', '.mkv', '.avi', '.gif', '.png', '.y4m', '.apng', '.m2ts', '.ts', '.mpeg', '.mpg', '.wmv', '.avif', '.webp'}
+
+
+def runtime_root():
+    """Source launches are portable; packaged executables use writable user data."""
+    if not getattr(sys, 'frozen', False):
+        selected = ROOT
+    elif sys.platform == 'win32':
+        base = os.environ.get('LOCALAPPDATA')
+        selected = (Path(base) if base and Path(base).is_absolute() else Path.home() / 'AppData' / 'Local') / 'Gifski WebUI'
+    elif sys.platform == 'darwin':
+        selected = Path.home() / 'Library' / 'Application Support' / 'Gifski WebUI'
+    else:
+        base = os.environ.get('XDG_DATA_HOME')
+        selected = (Path(base) if base and Path(base).is_absolute() else Path.home() / '.local' / 'share') / 'Gifski WebUI'
+    selected = selected.resolve()
+    try:
+        selected.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=selected):
+            pass
+    except OSError:
+        destination = 'app folder' if not getattr(sys, 'frozen', False) else 'user application-data folder'
+        raise ValueError(f'The {destination} is not writable. Move the source app to a writable folder or check folder permissions.') from None
+    return selected
 
 
 class Server(ThreadingHTTPServer):
@@ -34,6 +61,9 @@ class Server(ThreadingHTTPServer):
     def __init__(self, address, engine, preview=False):
         super().__init__(address, Handler)
         self.engine = engine
+        self.presets = PresetStore(engine.root)
+        self.tools_snapshot = {}
+        self.tools_snapshot_lock = threading.Lock()
         self.dependencies = DependencyManager(engine.root, on_change=self.invalidate_tools)
         self.token = secrets.token_urlsafe(32)
         self.preview = preview
@@ -47,12 +77,27 @@ class Server(ThreadingHTTPServer):
     def invalidate_tools(self):
         self.engine.invalidate_status()
 
+    def installed_status(self):
+        # A dependency download must never make status polling execute binaries.
+        if self.dependencies.status()['busy']:
+            with self.tools_snapshot_lock:
+                return copy.deepcopy(self.tools_snapshot)
+        snapshot = self.engine.status()
+        with self.tools_snapshot_lock:
+            self.tools_snapshot = copy.deepcopy(snapshot)
+        self.dependencies.status(snapshot.get('tools', {}))
+        return snapshot
+
     def refresh_tools_snapshot(self):
         with self.operation_lock:
+            if self.dependencies.status()['busy']:
+                raise ValueError('Wait for dependency installation to finish before refreshing executable versions.')
             self.invalidate_tools()
-            return self.engine.status().get('tools', {})
+            return self.installed_status().get('tools', {})
 
     def server_close(self):
+        if hasattr(self, 'dependencies'):
+            self.dependencies.close()
         if hasattr(self, 'thumbnails'):
             self.thumbnails.close()
         super().server_close()
@@ -268,9 +313,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self.guard():
                 return
             if route == '/api/dependencies':
-                return self.send_json(self.server.dependencies.status(self.server.engine.status().get('tools', {})))
+                return self.send_json(self.server.dependencies.status())
             if route == '/api/status':
-                return self.send_json(self.server.engine.status())
+                return self.send_json(self.server.installed_status())
+            if route == '/api/presets':
+                return self.send_json(self.server.presets.read())
+            if route == '/api/preferences':
+                saved = self.server.presets.read()
+                return self.send_json({key: saved[key] for key in ('preferences', 'revision')})
             if route == '/api/jobs':
                 summaries = urllib.parse.parse_qs(parsed.query).get('summary') == ['1']
                 jobs = self.server.engine.list_job_summaries() if summaries else self.server.engine.list_jobs()
@@ -306,6 +356,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({'error': 'Not found.'}, 404)
         except (ConnectionError, TimeoutError):
             self.close_connection = True
+        except PresetConflict as error:
+            self.request_error(error, 409)
+        except PresetStoreUnavailable as error:
+            self.request_error(error, 503)
         except (ValueError, KeyError, IndexError, FileNotFoundError) as e:
             self.request_error(e, 400)
         except Exception as e:
@@ -328,7 +382,7 @@ class Handler(BaseHTTPRequestHandler):
                 if Path(name).suffix.lower() not in MEDIA:
                     self.close_connection = True
                     return self.send_json({'error': 'Choose a video, GIF, Y4M or PNG file.'}, 400)
-                directory = ROOT / 'data/uploads' / secrets.token_hex(8)
+                directory = self.server.engine.root / 'data/uploads' / secrets.token_hex(8)
                 directory.mkdir(parents=True, exist_ok=True)
                 if shutil.disk_usage(directory).free < length + 64 * 1024 ** 2:
                     directory.rmdir()
@@ -351,9 +405,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.register_source({'path': str(target)})
                 return self.send_json({'path': str(target), 'name': name, 'bytes': length})
             body = self.body_json()
+            if route == '/api/presets':
+                return self.send_json(self.server.presets.replace(body))
+            if route == '/api/preferences':
+                saved = self.server.presets.replace_preferences(body)
+                return self.send_json({key: saved[key] for key in ('preferences', 'revision')})
             if route == '/api/status/refresh':
-                self.server.invalidate_tools()
-                return self.send_json(self.server.engine.status())
+                with self.server.operation_lock:
+                    if self.server.dependencies.status()['busy']:
+                        return self.send_json({'error': 'Wait for dependency installation to finish before scanning tools.'}, 409)
+                    self.server.invalidate_tools()
+                    return self.send_json(self.server.installed_status())
+            if route == '/api/dependencies/cancel':
+                return self.send_json(self.server.dependencies.cancel(), 202)
             if route == '/api/dependencies/check-updates':
                 return self.send_json(self.server.dependencies.check_updates(refresh_installed=self.server.refresh_tools_snapshot), 202)
             if route == '/api/dependencies/install-missing':
@@ -361,13 +425,16 @@ class Handler(BaseHTTPRequestHandler):
                     if self.server.engine.has_active_jobs():
                         return self.send_json({'error': 'Finish or cancel queued jobs before installing tools.'}, 409)
                     self.server.invalidate_tools()
-                    installed = self.server.engine.status().get('tools', {})
+                    installed = self.server.installed_status().get('tools', {})
                     return self.send_json(self.server.dependencies.install_missing(installed), 202)
             if route == '/api/dependencies/install':
                 with self.server.operation_lock:
                     if self.server.engine.has_active_jobs():
                         return self.send_json({'error': 'Finish or cancel queued jobs before installing tools.'}, 409)
-                    return self.send_json(self.server.dependencies.install(body.get('tool')), 202)
+                    if self.server.dependencies.status()['busy']:
+                        return self.send_json({'error': 'A dependency installation is already running.'}, 409)
+                    installed = self.server.installed_status().get('tools', {})
+                    return self.send_json(self.server.dependencies.install(body.get('tool'), installed_tools=installed), 202)
             if route == '/api/config':
                 with self.server.operation_lock:
                     if self.server.dependencies.status()['busy'] or self.server.engine.has_active_jobs():
@@ -375,18 +442,27 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(self.server.engine.configure(body))
             if route == '/api/probe':
                 source = self.object_field(body, 'source', body)
-                result = self.server.engine.probe(source)
+                with self.server.operation_lock:
+                    dependency_state = self.server.dependencies.status()
+                    if dependency_state.get('blocksEncoding', dependency_state['busy']):
+                        return self.send_json({'error': 'Wait for dependency installation to finish before inspecting a new source.'}, 409)
+                    result = self.server.engine.probe(source)
                 self.register_source(source)
                 if result.get('path'):
                     self.register_source({'path': result['path']})
                 return self.send_json(result)
             if route == '/api/plan':
-                return self.send_json(self.server.engine.plan(self.object_field(body, 'settings', body)))
+                with self.server.operation_lock:
+                    dependency_state = self.server.dependencies.status()
+                    if dependency_state.get('blocksEncoding', dependency_state['busy']):
+                        return self.send_json({'error': 'Wait for dependency installation to finish before planning with these tools.'}, 409)
+                    return self.send_json(self.server.engine.plan(self.object_field(body, 'settings', body)))
             if route == '/api/jobs':
                 settings = self.object_field(body, 'settings', {})
                 self.object_field(settings, 'source', {})
                 with self.server.operation_lock:
-                    if self.server.dependencies.status()['busy']:
+                    dependency_state = self.server.dependencies.status()
+                    if dependency_state.get('blocksEncoding', dependency_state['busy']):
                         return self.send_json({'error': 'Wait for the dependency installation to finish before starting a job.'}, 409)
                     result = self.server.engine.submit(settings, body.get('mode', 'encode'))
                 self.register_source(settings.get('source', {}))
@@ -397,6 +473,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({'error': 'Not found.'}, 404)
         except (ConnectionError, TimeoutError):
             self.close_connection = True
+        except PresetConflict as error:
+            self.request_error(error, 409)
+        except PresetStoreUnavailable as error:
+            self.request_error(error, 503)
         except (ValueError, KeyError, IndexError, FileNotFoundError, json.JSONDecodeError) as e:
             self.close_connection = True
             self.request_error(e, 400)
@@ -413,7 +493,10 @@ def main():
     parser.add_argument('--strictPort', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     port = int(os.environ.get('PORT', args.port)) if args.preview else args.port
-    engine = Engine(ROOT)
+    try:
+        engine = Engine(runtime_root())
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from None
     try:
         server = Server(('0.0.0.0' if args.preview else '127.0.0.1', port), engine, args.preview)
     except OSError as e:

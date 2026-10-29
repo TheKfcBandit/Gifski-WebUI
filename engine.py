@@ -561,8 +561,13 @@ class Engine:
         source = job.get('settings', {}).get('source', {})
         metadata = job.get('sourceMetadata', {})
         raw = metadata.get('path') or next(iter(source.get('paths') or []), '') or source.get('path')
-        if (not isinstance(raw, str) or not raw or len(raw) > 4096 or '\x00' in raw or
-                raw.startswith(('//', '\\\\')) or re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', raw)):
+        if not isinstance(raw, str) or len(raw) > 4096 or '\x00' in raw:
+            return None
+        # Apply the same paste-friendly spelling cleanup as _paths before
+        # checking network paths, so quoted UNC paths never reach filesystem IO.
+        raw = raw.strip().strip('"')
+        if (not raw or raw != raw.strip().strip('"') or raw.startswith(('//', '\\\\')) or
+                re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', raw)):
             return None
         seek = job.get('settings', {}).get('trim', {}).get('start', 0)
         if source.get('kind') == 'sequence' or Path(raw).suffix.lower() in ('.png', '.jpg', '.jpeg', '.bmp', '.tiff'):
@@ -607,13 +612,18 @@ class Engine:
         if source is not None:
             try:
                 path = self._paths({'kind': 'video', 'path': source[0]})[0]
-            except (ValueError, OSError):
+            except (ValueError, OSError, RuntimeError):
                 return None
             return {'id': jid, 'status': status, 'index': 'source', 'path': path, 'seek': source[1]}
         if index != 'source':
-            root = self.outputs.resolve()
-            directory = (root / jid).resolve()
-            path = (directory / filename).resolve()
+            try:
+                root = self.outputs.resolve()
+                directory = (root / jid).resolve()
+                path = (directory / filename).resolve()
+            except (OSError, RuntimeError):
+                # Deleted folders and link loops are a missing preview, not a
+                # reason for history polling to fail.
+                return None
             if directory != root / jid or path.parent != directory:
                 return None
             return {'id': jid, 'status': status, 'index': index, 'path': path, 'seek': 0}
@@ -1318,7 +1328,7 @@ class Engine:
             actual_width = pinned_width or max(1, round(width * pinned_height / height))
             actual_height = pinned_height or max(1, round(height * pinned_width / width))
             if actual_width * actual_height > 16_000_000:
-                raise ValueError('Pinned resolution exceeds the 16-megapixel Smart limit. Choose smaller dimensions or use Advanced export.')
+                raise ValueError('Locked resolution exceeds the 16-megapixel Smart limit. Choose smaller dimensions or use Advanced export.')
             base_width = actual_width
         else:
             scale = min(1.0, math.sqrt(16_000_000 / (width * height)))
@@ -1341,11 +1351,11 @@ class Engine:
     @staticmethod
     def _validate_smart_pins(s):
         if s['smart']['pinResolution'] and s['width'] is None and s['height'] is None:
-            raise ValueError('Pinning resolution requires a width or height.')
+            raise ValueError('Locking resolution requires a width or height.')
         if s['smart']['pinFps']:
             effective_fps = s['fps'] * s['speed'] if s['source']['kind'] == 'sequence' else s['fps']
             if effective_fps > 50:
-                raise ValueError('Pinned playback FPS must not exceed 50; GIF frame delays cannot preserve a higher rate reliably.')
+                raise ValueError('Locked playback FPS must not exceed 50; GIF frame delays cannot preserve a higher rate reliably.')
 
     @staticmethod
     def _fidelity_score(width, fps, quality, base_width, base_fps):
@@ -1373,9 +1383,9 @@ class Engine:
                              'frameCacheHits': 0, 'phase': 'screening', 'reason': '',
                              'pinResolution': pin_resolution, 'pinFps': pin_fps}
             if pin_resolution and (base['width'] != s['width'] or base['height'] != s['height']):
-                job.setdefault('warnings', []).append('Pinned dimensions are limited to the cropped source bounds; Smart never upscales.')
+                job.setdefault('warnings', []).append('Locked dimensions are limited to the cropped source bounds; Smart never upscales.')
             if pin_resolution and base['width'] and base['height']:
-                job.setdefault('warnings', []).append('Both dimensions are pinned independently. Leave one blank to preserve the source aspect ratio.')
+                job.setdefault('warnings', []).append('Both dimensions are locked independently. Leave one blank to preserve the source aspect ratio.')
             if not pin_resolution and metadata['width'] * metadata['height'] > 16_000_000 and not s['crop']['enabled']:
                 job.setdefault('warnings', []).append('Adaptive exports limit each frame to 16 megapixels for memory safety.')
         try:
@@ -1561,7 +1571,7 @@ class Engine:
                 job['bestIndex'] = min(results, key=lambda r: r['bytes'])['index']
                 pins = job['search'].get('pinResolution') or job['search'].get('pinFps')
                 job['searchNote'] = (f'No tested candidate fits {target:,} bytes. The smallest measured result is shown without a fit claim. '
-                                     + ('Pinned settings were preserved. Relax a pin, shorten the clip or increase the limit.' if pins else
+                                     + ('Locked settings were preserved. Unlock a setting, shorten the clip or increase the limit.' if pins else
                                         'Shorten the clip or increase the limit.'))
             job['search']['reason'] = reason
             job['search']['phase'] = 'complete'

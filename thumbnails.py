@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import queue
 import re
+import stat
 import subprocess
 import tempfile
 import threading
@@ -61,6 +62,25 @@ class ThumbnailCache:
                 return source.read(2) == b'\xff\xd9'
         except OSError:
             return False
+
+    @staticmethod
+    def _has_redirect(path):
+        """Reject symlink/junction traversal without rejecting Windows 8.3 names.
+
+        resolve() can change a valid local path's spelling even when there is no
+        link: Windows expands short names and normalizes drive/path casing.
+        Inspect directory entries rather than treating that spelling change as
+        proof of a filesystem redirect. Reparse tags cover junctions on Python
+        3.10 and 3.11, before Path.is_junction() became available.
+        """
+        link_tags = {getattr(stat, name, None) for name in
+                     ('IO_REPARSE_TAG_SYMLINK', 'IO_REPARSE_TAG_MOUNT_POINT')}
+        link_tags.discard(None)
+        for component in (path, *path.parents):
+            metadata = component.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or getattr(metadata, 'st_reparse_tag', None) in link_tags:
+                return True
+        return False
 
     def _schedule(self, jid, index):
         key = (jid, index)
@@ -136,10 +156,14 @@ class ThumbnailCache:
         if index == 'source':
             # Only the engine's selected, local job source can be used here.
             # Never send its path to the browser or accept a path from the URL.
-            raw = str(selected['path'])
+            raw = str(selected['path']).strip().strip('"')
+            source = Path(raw)
             if (raw.startswith(('\\\\', '//')) or re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', raw)
                     or not source.is_absolute() or source.suffix.lower() not in SOURCE_SUFFIXES
-                    or source.resolve() != source.absolute()):
+                    or self._has_redirect(source)):
+                raise ValueError('Thumbnail source must be a local media file.')
+            source = source.resolve(strict=True)
+            if str(source).startswith(('\\\\', '//')):
                 raise ValueError('Thumbnail source must be a local media file.')
         elif source.suffix.lower() != '.gif' or source.resolve().parent != directory:
             raise ValueError('Thumbnail source must be a completed GIF in its job folder.')

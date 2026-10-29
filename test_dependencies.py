@@ -313,7 +313,7 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(status['tools']['gifski']['state'], 'idle')
         self.assertTrue(status['tools']['gifski']['available'])
         self.assertEqual(status['tools']['ffmpeg']['state'], 'queued')
-        self.assertEqual(thread.call_args.kwargs['args'], (['ffmpeg'],))
+        self.assertEqual(thread.call_args_list[0].kwargs['args'], (['ffmpeg'],))
         with self.assertRaises(ValueError):
             manager.install('gifski')
         with self.assertRaises(ValueError):
@@ -489,6 +489,237 @@ class DependencyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'regular file'):
             manager._publish('gifski', {'gifski.exe': stage / 'gifski.exe'}, stage)
         self.assertEqual(outside.read_bytes(), b'old')
+
+    def test_cancel_is_nonblocking_and_encoding_waits_until_download_cleanup(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        bin_dir = self.root / 'bin'; bin_dir.mkdir()
+        original = bin_dir / 'gifski.exe'; original.write_bytes(b'previous executable')
+        entered, release = threading.Event(), threading.Event()
+        payload = b'partial archive'
+        class Response(io.BytesIO):
+            headers = {'Content-Length': str(len(payload))}
+            def read1(self, size):
+                entered.set()
+                if not release.wait(3):
+                    raise TimeoutError('Test release was not signaled.')
+                return super().read1(size)
+        response = Response(payload)
+        installed = {'gifski': {'available': True, 'origin': 'local', 'path': str(original)}}
+        with patch.object(manager, '_metadata', return_value=(dep.GITHUB_RELEASE, hashlib.sha256(payload).hexdigest(), ['gifski.exe'])), \
+             patch.object(dep, '_open', return_value=response), patch.object(dep.subprocess, 'run') as run:
+            manager.install('gifski', installed)
+            try:
+                self.assertTrue(entered.wait(2))
+                started = time.monotonic()
+                cancelled = manager.cancel()
+                self.assertLess(time.monotonic() - started, 0.2)
+                self.assertEqual(cancelled['installation']['state'], 'cancelling')
+                self.assertTrue(cancelled['busy'])
+                self.assertTrue(cancelled['blocksEncoding'])
+                self.assertFalse(response.closed)
+                with self.assertRaises(ValueError):
+                    manager.install('ffmpeg')
+            finally:
+                release.set()
+                manager._install_thread.join(3)
+            run.assert_not_called()
+        self.assertFalse(manager._install_thread.is_alive())
+        self.assertTrue(response.closed)
+        self.assertEqual(manager.status()['installation']['state'], 'cancelled')
+        self.assertFalse(manager.status()['busy'])
+        self.assertEqual(original.read_bytes(), b'previous executable')
+        self.assertFalse(list(bin_dir.glob('.install-*')))
+
+    def test_installing_alternative_path_tools_does_not_block_encoding_and_shutdown_is_bounded(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        entered, release = threading.Event(), threading.Event()
+        def metadata(name):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError('Test release was not signaled.')
+            raise ValueError('Simulated provider response after cancellation')
+        installed = {name: {'available': True, 'origin': 'path', 'path': '/system/' + name}
+                     for name in ('gifski', 'ffmpeg', 'ffprobe')}
+        with patch.object(manager, '_metadata', side_effect=metadata):
+            manager.install('ffmpeg', installed)
+            try:
+                self.assertTrue(entered.wait(2))
+                status = manager.status()
+                self.assertTrue(status['busy'])
+                self.assertFalse(status['blocksEncoding'])
+                self.assertFalse(status['tools']['ffmpeg']['portableUpdateAffectsActive'])
+                started = time.monotonic()
+                manager.close(timeout=0.01)
+                self.assertLess(time.monotonic() - started, 0.3)
+                self.assertTrue(manager.status()['busy'])
+                with self.assertRaisesRegex(ValueError, 'shutting down'):
+                    manager.install('gifski')
+            finally:
+                release.set()
+                manager._install_thread.join(3)
+        self.assertFalse(manager.status()['busy'])
+        self.assertEqual(manager.status()['installation']['state'], 'cancelled')
+        self.assertFalse(list((self.root / 'bin').glob('.install-*')))
+
+    def test_batch_cancellation_skips_remaining_tools(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        entered, release = threading.Event(), threading.Event()
+        def metadata(name):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError('Test release was not signaled.')
+            return dep.GITHUB_RELEASE, '0' * 64, ['gifski.exe']
+        with patch.object(manager, '_metadata', side_effect=metadata) as metadata_call, patch.object(manager, '_download') as download:
+            manager.install_missing({})
+            try:
+                self.assertTrue(entered.wait(2))
+                manager.cancel()
+            finally:
+                release.set()
+                manager._install_thread.join(3)
+            metadata_call.assert_called_once_with('gifski')
+            download.assert_not_called()
+        status = manager.status()
+        self.assertFalse(status['busy'])
+        self.assertEqual(status['setup']['state'], 'cancelled')
+        self.assertEqual(status['setup']['remaining'], [])
+        self.assertTrue(all(tool['state'] == 'cancelled' for tool in status['tools'].values()))
+
+    def test_download_telemetry_handles_known_and_unknown_lengths(self):
+        payload = b'payload' * 20000
+        for total in (len(payload), 0):
+            with self.subTest(total=total):
+                manager = dep.DependencyManager(self.root)
+                class Response(io.BytesIO):
+                    headers = {'Content-Length': str(total)}
+                target = self.root / f'download-{total}'
+                with patch.object(dep, '_open', return_value=Response(payload)) as open_download:
+                    manager._download('gifski', dep.GITHUB_RELEASE, target, hashlib.sha256(payload).hexdigest())
+                open_download.assert_called_once_with(dep.GITHUB_RELEASE, timeout=dep.INSTALL_SOCKET_TIMEOUT_SECONDS)
+                item = manager.status()['installation']
+                self.assertEqual(item['phase'], 'download')
+                self.assertEqual(item['bytesReceived'], len(payload))
+                self.assertEqual(item['totalBytes'], total)
+                self.assertGreater(item['bytesPerSecond'], 0)
+                self.assertEqual(item['etaSeconds'], 0 if total else None)
+
+    def test_whole_operation_and_idle_deadlines_stop_without_publishing(self):
+        for stalled in ('whole', 'idle'):
+            with self.subTest(stalled=stalled):
+                manager = dep.DependencyManager(self.root); manager.supported = True
+                with patch.object(dep.threading, 'Thread'):
+                    manager.install('gifski')
+                operation = manager._operation
+                now = time.monotonic()
+                if stalled == 'whole':
+                    operation['started'] = now - dep.INSTALL_TIMEOUT_SECONDS - 1
+                    operation['lastProgress'] = now
+                else:
+                    operation['lastProgress'] = now - dep.INSTALL_IDLE_SECONDS - 1
+                with self.assertRaises(dep.InstallationTimeout):
+                    manager._checkpoint('gifski', progress=True)
+                with patch.object(manager, '_install_worker') as worker:
+                    manager._run_installation(['gifski'])
+                    worker.assert_not_called()
+                status = manager.status()
+                self.assertEqual(status['installation']['state'], 'failed')
+                self.assertFalse(status['busy'])
+                self.assertIn('20-minute' if stalled == 'whole' else '45 seconds', status['installation']['error'])
+
+    def test_cancel_during_publication_rolls_back_before_releasing_encoding(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        destination = self.root / 'bin'; destination.mkdir()
+        stage = self.root / 'stage'; stage.mkdir()
+        for name in ('ffmpeg.exe', 'ffprobe.exe'):
+            (destination / name).write_bytes(('old ' + name).encode())
+            (stage / name).write_bytes(('new ' + name).encode())
+        with patch.object(dep.threading, 'Thread'):
+            manager.install('ffmpeg')
+        manager._operation['publishing'] = True
+        original_replace = dep.os.replace
+        def replace(source, target):
+            original_replace(source, target)
+            if Path(source) == stage / 'ffmpeg.exe':
+                manager.cancel()
+                self.assertTrue(manager.status()['blocksEncoding'])
+        with patch.object(dep.os, 'replace', side_effect=replace):
+            with self.assertRaises(dep.InstallationCancelled):
+                manager._publish('ffmpeg', {name: stage / name for name in ('ffmpeg.exe', 'ffprobe.exe')}, stage)
+        self.assertEqual((destination / 'ffmpeg.exe').read_bytes(), b'old ffmpeg.exe')
+        self.assertEqual((destination / 'ffprobe.exe').read_bytes(), b'old ffprobe.exe')
+        manager._operation['publishing'] = False
+        manager._run_installation(['ffmpeg'])
+        self.assertFalse(manager.status()['busy'])
+
+    def test_late_cancellation_reports_completed_and_refresh_happens_before_unblock(self):
+        archive = self.archive([('gifski.exe', executable())])
+        from types import SimpleNamespace
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        def refresh():
+            self.assertTrue(manager.status()['busy'])
+            self.assertTrue(manager.status()['blocksEncoding'])
+            self.assertNotEqual(manager.status()['tools']['gifski']['state'], 'completed')
+            manager.cancel()
+        manager.on_change = refresh
+        def download(tool, url, destination, digest):
+            destination.write_bytes(archive.read_bytes())
+        with patch.object(manager, '_metadata', return_value=(dep.GITHUB_RELEASE, 'a' * 64, ['gifski.exe'])), \
+             patch.object(manager, '_download', side_effect=download), \
+             patch.object(dep.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='gifski 1.34.0', stderr='')):
+            manager.install('gifski')
+            manager._install_thread.join(3)
+        status = manager.status()
+        self.assertEqual(status['installation']['state'], 'completed')
+        self.assertEqual(status['tools']['gifski']['state'], 'completed')
+        self.assertFalse(status['busy'])
+        self.assertTrue((self.root / 'bin/gifski.exe').is_file())
+
+    def test_refresh_failure_after_publication_does_not_claim_nothing_was_installed(self):
+        archive = self.archive([('gifski.exe', executable())])
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        manager = dep.DependencyManager(self.root, on_change=Mock(side_effect=RuntimeError('private details')))
+        def download(tool, url, destination, digest):
+            destination.write_bytes(archive.read_bytes())
+        with patch.object(manager, '_metadata', return_value=(dep.GITHUB_RELEASE, 'a' * 64, ['gifski.exe'])), \
+             patch.object(manager, '_download', side_effect=download), \
+             patch.object(dep.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='gifski 1.34.0', stderr='')):
+            manager._install_worker('gifski')
+        status = manager.status()['tools']['gifski']
+        self.assertEqual(status['state'], 'completed')
+        self.assertTrue(status['installed'])
+        self.assertIn('files were installed', status['error'])
+        self.assertNotIn('private details', json.dumps(status))
+
+    def test_cancelled_stalled_worker_cannot_publish_and_keeps_cleanup_visible(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        with patch.object(dep.threading, 'Thread'):
+            manager.install('gifski')
+        manager.cancel()
+        operation = manager._operation
+        operation['abortAt'] = time.monotonic() - dep.INSTALL_CANCEL_GRACE_SECONDS - 1
+        with patch.object(operation['done'], 'wait', return_value=False):
+            manager._watch_installation(operation)
+        status = manager.status()
+        self.assertTrue(status['busy'])
+        self.assertTrue(status['installation']['cleanupPending'])
+        self.assertFalse(status['blocksEncoding'])
+        with self.assertRaises(dep.InstallationCancelled):
+            manager._checkpoint('gifski')
+        with self.assertRaises(ValueError):
+            manager.install('ffmpeg')
+        manager._run_installation(['gifski'])
+        self.assertFalse(manager.status()['busy'])
+        self.assertFalse(manager.status()['installation']['cleanupPending'])
+
+    def test_unexpected_worker_exit_releases_installation_gate(self):
+        manager = dep.DependencyManager(self.root); manager.supported = True
+        with patch.object(manager, '_install_worker', side_effect=KeyboardInterrupt):
+            manager.install('gifski')
+            manager._install_thread.join(3)
+        self.assertFalse(manager._install_thread.is_alive())
+        self.assertFalse(manager.status()['busy'])
+        self.assertEqual(manager.status()['installation']['state'], 'failed')
 
 
 if __name__ == '__main__':

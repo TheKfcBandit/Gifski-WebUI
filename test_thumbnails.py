@@ -1,5 +1,7 @@
 """History preview safety, caching, and lifecycle checks without media downloads."""
 from pathlib import Path
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -7,6 +9,7 @@ import threading
 import time
 import unittest
 import shutil
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from thumbnails import MAX_PENDING, MAX_THUMBNAIL_BYTES, ThumbnailCache
@@ -158,18 +161,66 @@ class ThumbnailTests(unittest.TestCase):
             self.assertEqual(self.cache.file_for('estimate').name, 'thumbnail-source.jpg')
             command = run.call_args.args[0]
             self.assertEqual(command[command.index('-ss') + 1], '1.5')
-            self.assertEqual(command[command.index('-i') + 1], str(source))
+            self.assertEqual(command[command.index('-i') + 1], str(source.resolve()))
         self.cache.file_for('estimate').unlink()
         for seek in (float('nan'), float('inf'), -1, 8_640_001, True, '1'):
             self.engine.items['estimate']['seek'] = seek
             with self.subTest(seek=seek), self.assertRaises(ValueError):
                 self.cache._render('estimate', 'source')
         self.engine.items['estimate']['seek'] = 0
-        for path in ('https://example.test/clip.mp4', '//server/share/clip.mp4', '\\\\server\\share\\clip.mp4', 'relative.mp4'):
+        for path in ('https://example.test/clip.mp4', '//server/share/clip.mp4', '\\\\server\\share\\clip.mp4',
+                     ' "\\\\server\\share\\clip.mp4" ', ' "https://example.test/clip.mp4" ', 'relative.mp4'):
             self.engine.items['estimate']['path'] = path
             with self.subTest(path=path), patch('thumbnails.subprocess.Popen') as run, self.assertRaises(ValueError):
                 self.cache._render('estimate', 'source')
             run.assert_not_called()
+
+    def test_legitimate_source_path_normalization_is_not_a_redirect(self):
+        self.engine.add('estimate')
+        source = self.root / 'clip.mp4'
+        source.write_bytes(b'test video')
+        (self.root / 'folder').mkdir()
+        spelling = self.root / 'folder' / '..' / 'clip.mp4'
+        self.assertNotEqual(spelling.absolute(), spelling.resolve())
+        self.engine.items['estimate'].update(index='source', path=spelling, seek=0)
+        with patch('thumbnails.subprocess.Popen', side_effect=FinishedProcess) as run:
+            self.cache._render('estimate', 'source')
+        self.assertEqual(self.cache.file_for('estimate').read_bytes(), JPEG)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index('-i') + 1], str(source.resolve()))
+
+    def test_windows_junction_tag_is_rejected_even_without_symlink_mode(self):
+        path = self.root / 'junction' / 'clip.mp4'
+        junction_tag = object()
+        def metadata(component):
+            return SimpleNamespace(st_mode=stat.S_IFDIR if component.name == 'junction' else stat.S_IFREG,
+                                   st_reparse_tag=junction_tag if component.name == 'junction' else 0)
+        with patch.object(stat, 'IO_REPARSE_TAG_MOUNT_POINT', junction_tag, create=True), patch.object(Path, 'lstat', metadata):
+            self.assertTrue(self.cache._has_redirect(path))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows short-path API required')
+    def test_windows_short_source_path_renders_using_canonical_path(self):
+        import ctypes
+        self.engine.add('estimate')
+        directory = self.root / 'Long source directory for thumbnail test'
+        directory.mkdir()
+        source = directory / 'Long source filename.mp4'
+        source.write_bytes(b'test video')
+        get_short_path = ctypes.windll.kernel32.GetShortPathNameW
+        get_short_path.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint)
+        get_short_path.restype = ctypes.c_uint
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_short_path(str(source), buffer, len(buffer))
+        if not 0 < length < len(buffer) or Path(buffer.value) == source.resolve():
+            self.skipTest('This filesystem does not expose a short-path alias')
+        alias = Path(buffer.value)
+        self.assertEqual(alias.resolve(), source.resolve())
+        self.engine.items['estimate'].update(index='source', path=alias, seek=0)
+        with patch('thumbnails.subprocess.Popen', side_effect=FinishedProcess) as run:
+            self.cache._render('estimate', 'source')
+        self.assertEqual(self.cache.file_for('estimate').read_bytes(), JPEG)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index('-i') + 1], str(source.resolve()))
 
     @unittest.skipUnless(shutil.which('ffmpeg'), 'Real FFmpeg unavailable')
     def test_estimate_without_gif_generates_real_static_source_thumbnail(self):

@@ -2,6 +2,7 @@
 import http.client
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -11,6 +12,8 @@ from unittest.mock import patch
 from urllib.parse import quote
 
 import server
+from presets import PresetStore
+from test_presets import recipe
 
 
 class FaultSocket:
@@ -123,7 +126,7 @@ class HTTPTests(unittest.TestCase):
             code, _, data = self.request('POST', '/api/dependencies/install', body='{"tool":"gifski"}', headers={'Content-Type': 'application/json'})
             self.assertEqual(code, 202)
             self.assertTrue(json.loads(data)['busy'])
-            install.assert_called_once_with('gifski')
+            install.assert_called_once_with('gifski', installed_tools={})
 
     def test_update_check_contract_and_origin_guard(self):
         with patch.object(self.http.dependencies, 'check_updates', return_value={'updates': {'state': 'checking'}}) as check, patch.object(self.engine, 'invalidate_status') as invalidate:
@@ -185,6 +188,65 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertEqual(json.loads(data)['jobs'][0]['id'], 'one')
             summaries.assert_called_once_with()
+
+    def test_preset_and_preference_api_roundtrip_conflict_and_guards(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(self.http, 'presets', PresetStore(root)):
+            self.assertEqual(self.request('GET', '/api/presets', auth=False)[0], 401)
+            self.assertEqual(self.json_post('/api/presets', {}, headers={'Origin': 'https://untrusted.example'})[0], 403)
+            code, _, raw = self.request('GET', '/api/presets')
+            initial = json.loads(raw)
+            self.assertEqual((code, initial['presets'], initial['preferences']), (200, [], {'keepAwake': False}))
+            code, _, raw = self.json_post('/api/presets', {'presets': [recipe()], 'revision': initial['revision']})
+            saved = json.loads(raw)
+            self.assertEqual((code, saved['presets']), (200, [recipe()]))
+            self.assertEqual(self.json_post('/api/presets', {'presets': [], 'revision': initial['revision']})[0], 409)
+            code, _, raw = self.json_post('/api/preferences', {'preferences': {'keepAwake': True}, 'revision': saved['revision']})
+            preferences = json.loads(raw)
+            self.assertEqual((code, preferences['preferences']), (200, {'keepAwake': True}))
+            self.assertEqual(json.loads(self.request('GET', '/api/presets')[2])['presets'], [recipe()])
+            self.assertEqual(json.loads(self.request('GET', '/api/preferences')[2]), preferences)
+            self.assertEqual(self.json_post('/api/preferences', {'preferences': {'keepAwake': 'true'}, 'revision': preferences['revision']})[0], 400)
+
+    def test_corrupt_app_presets_are_reported_and_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = PresetStore(root)
+            store.directory.mkdir()
+            store.path.write_bytes(b'corrupt but must be preserved')
+            with patch.object(self.http, 'presets', store):
+                self.assertEqual(self.request('GET', '/api/presets')[0], 503)
+                self.assertEqual(self.request('GET', '/api/preferences')[0], 503)
+                self.assertEqual(self.json_post('/api/presets', {'presets': [], 'revision': 'missing'})[0], 503)
+            self.assertEqual(store.path.read_bytes(), b'corrupt but must be preserved')
+
+    def test_dependency_poll_and_cancel_do_not_probe_tools_or_wait_for_operation_lock(self):
+        state = {'busy': True, 'blocksEncoding': True, 'installation': {'state': 'cancelling'}}
+        with patch.object(self.http.dependencies, 'status', return_value=state), patch.object(self.http.dependencies, 'cancel', return_value=state) as cancel, patch.object(self.engine, 'status', side_effect=AssertionError('Must not probe during installation')):
+            with self.http.operation_lock:
+                self.assertEqual(self.request('GET', '/api/dependencies')[0], 200)
+                self.assertEqual(self.request('GET', '/api/status')[0], 200)
+                code, _, raw = self.json_post('/api/dependencies/cancel', {})
+                self.assertEqual(code, 202)
+                self.assertTrue(json.loads(raw)['busy'])
+            cancel.assert_called_once_with()
+            self.assertEqual(self.json_post('/api/dependencies/cancel', {}, auth=False)[0], 401)
+            self.assertEqual(self.json_post('/api/status/refresh', {})[0], 409)
+            self.assertEqual(self.json_post('/api/probe', {'source': {'path': str(self.root / 'output.gif')}})[0], 409)
+            self.assertEqual(self.json_post('/api/plan', {'settings': {}})[0], 409)
+
+    def test_alternative_download_can_allow_encoding_without_allowing_config_changes(self):
+        with patch.object(self.http.dependencies, 'status', return_value={'busy': True, 'blocksEncoding': False}):
+            self.assertEqual(self.json_post('/api/jobs', {'settings': {'source': {}}})[0], 201)
+            self.assertEqual(self.json_post('/api/probe', {'source': {'path': str(self.root / 'output.gif')}})[0], 200)
+            self.assertEqual(self.json_post('/api/plan', {'settings': {}})[0], 200)
+            self.assertEqual(self.json_post('/api/config', {'ffmpeg': 'new'})[0], 409)
+
+    def test_upload_uses_runtime_data_directory_separate_from_assets(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(self.engine, 'root', Path(folder)):
+            code, _, raw = self.request('POST', '/api/upload?name=runtime.mp4', b'media')
+            self.assertEqual(code, 200)
+            path = Path(json.loads(raw)['path'])
+            self.assertTrue(path.is_relative_to(Path(folder) / 'data' / 'uploads'))
+            self.assertEqual(path.read_bytes(), b'media')
 
     def request(self, method, path, body=None, auth=True, headers=None):
         h = {'Connection': 'close'}
@@ -383,6 +445,37 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('attachment;', headers['Content-Disposition'])
         self.assertEqual(self.request('GET', '/api/files/unknown/0')[0], 400)
+
+
+class RuntimeRootTests(unittest.TestCase):
+    def test_source_launch_keeps_data_in_app_folder_regardless_of_cwd(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'ROOT', Path(folder).resolve()), patch.object(server.sys, 'frozen', False, create=True), patch('os.getcwd', return_value='/unrelated'):
+            self.assertEqual(server.runtime_root(), Path(folder).resolve())
+
+    def test_frozen_windows_data_uses_local_app_data_and_keeps_assets_separate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder).resolve()
+            with patch.object(server.sys, 'frozen', True, create=True), patch.object(server.sys, 'platform', 'win32'), patch.dict(os.environ, {'LOCALAPPDATA': str(base)}):
+                selected = server.runtime_root()
+                self.assertEqual(selected, base / 'Gifski WebUI')
+                self.assertNotEqual(selected, server.ROOT)
+                self.assertTrue(selected.is_dir())
+
+    def test_frozen_relative_data_env_uses_home_fallback(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server.sys, 'frozen', True, create=True), patch.object(server.sys, 'platform', 'win32'), patch.dict(os.environ, {'LOCALAPPDATA': 'relative-folder'}), patch('pathlib.Path.home', return_value=Path(folder)):
+            self.assertEqual(server.runtime_root(), Path(folder).resolve() / 'AppData' / 'Local' / 'Gifski WebUI')
+
+    def test_unwritable_source_folder_fails_without_silent_global_fallback(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'ROOT', Path(folder)), patch.object(server.sys, 'frozen', False, create=True), patch.object(server.tempfile, 'TemporaryFile', side_effect=PermissionError):
+            with self.assertRaisesRegex(ValueError, 'app folder is not writable'):
+                server.runtime_root()
+
+    def test_server_shutdown_closes_dependency_manager(self):
+        with tempfile.TemporaryDirectory() as folder:
+            http = server.Server(('127.0.0.1', 0), FakeEngine(Path(folder)))
+            with patch.object(http.dependencies, 'close') as close:
+                http.server_close()
+                close.assert_called_once_with()
 
 
 if __name__ == '__main__':

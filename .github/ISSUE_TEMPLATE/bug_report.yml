@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible encoding, interface, installation, or startup failure.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "Remove usernames, full local paths, tokens, and private media before submitting."
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: App version or commit, OS, Python version, Gifski/FFmpeg versions, and PATH or app-local installation.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include mode, relevant settings, and source dimensions/duration. Use a generated or public sample if needed.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted error or log
+      render: text

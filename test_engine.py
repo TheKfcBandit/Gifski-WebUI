@@ -90,22 +90,67 @@ class EngineTests(unittest.TestCase):
         job.update(status='completed', mode='estimate', settings=copy.deepcopy(self.settings))
         job['settings']['trim'] = {'start': 1.5, 'end': 5}
         snapshot = self.engine.thumbnail_input('process')
-        self.assertEqual((snapshot['index'], snapshot['path'], snapshot['seek']), ('source', self.source, 1.5))
+        self.assertEqual((snapshot['index'], snapshot['path'], snapshot['seek']), ('source', self.source.resolve(), 1.5))
         self.assertEqual(self.engine.list_job_summaries()[0]['thumbnailIndex'], 'source')
         job['settings']['source']['kind'] = 'sequence'
         self.assertEqual(self.engine.thumbnail_input('process')['seek'], 0)
         self.source.unlink()
         self.assertIsNone(self.engine.thumbnail_input('process'))
 
+    def test_unresolvable_thumbnail_paths_leave_a_placeholder(self):
+        job = self.process_job()
+        job.update(status='completed', settings=copy.deepcopy(self.settings))
+        with patch.object(self.engine, '_paths', side_effect=RuntimeError('Symbolic link loop')):
+            self.assertIsNone(self.engine.thumbnail_input('process'))
+        job['results'] = [{'filename': 'output.gif'}]
+        with patch('engine.Path.resolve', side_effect=RuntimeError('Symbolic link loop')):
+            self.assertIsNone(self.engine.thumbnail_input('process'))
+
     def test_source_thumbnail_rejects_network_paths_and_invalid_seek(self):
         job = self.process_job()
         job.update(status='completed', settings=copy.deepcopy(self.settings))
-        for path in ('https://example.com/video.mp4', r'\\server\video.mp4', '//server/video.mp4'):
-            job['settings']['source']['path'] = path
-            self.assertIsNone(self.engine.thumbnail_input('process'))
+        for path in ('https://example.com/video.mp4', r'\\server\video.mp4', '//server/video.mp4',
+                     '  "\\\\server\\video.mp4"  ', ' "https://example.com/video.mp4" ',
+                     '" \\\\server\\video.mp4 "', '" "\\\\server\\video.mp4" "'):
+            with self.subTest(path=path), patch.object(self.engine, '_paths') as paths:
+                job['settings']['source']['path'] = path
+                self.assertIsNone(self.engine.thumbnail_input('process'))
+                paths.assert_not_called()
         job['settings']['source']['path'] = str(self.source)
         job['settings']['trim'] = {'start': float('nan')}
         self.assertIsNone(self.engine.thumbnail_input('process'))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Requires Windows short-name aliases')
+    def test_windows_short_path_aliases_keep_canonical_source_and_portable_tools(self):
+        import ctypes
+        from ctypes import wintypes
+        directory = self.root / 'Windows alias regression directory'
+        directory.mkdir()
+        source = directory / 'input.gif'
+        source.write_bytes(GIF)
+        portable = directory / 'bin' / 'ffmpeg.exe'
+        portable.parent.mkdir()
+        portable.write_bytes(b'fake')
+        short_path = ctypes.WinDLL('kernel32', use_last_error=True).GetShortPathNameW
+        short_path.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+        short_path.restype = wintypes.DWORD
+        required = short_path(str(directory.resolve()), None, 0)
+        if not required:
+            self.skipTest('The filesystem does not provide short path names')
+        buffer = ctypes.create_unicode_buffer(required)
+        self.assertGreater(short_path(str(directory.resolve()), buffer, required), 0)
+        alias = Path(buffer.value)
+        if alias == directory.resolve():
+            self.skipTest('8.3 name creation is disabled for this volume')
+        engine = Engine(alias)
+        engine.jobs['alias'] = {'id': 'alias', 'status': 'completed', 'results': [],
+                                'settings': {'source': {'kind': 'video', 'path': str(alias / 'input.gif')}}}
+        snapshot = engine.thumbnail_input('alias')
+        self.assertEqual(snapshot['path'], source.resolve())
+        self.assertTrue(snapshot['path'].samefile(source))
+        self.assertEqual(engine.root, directory.resolve())
+        with patch('engine.shutil.which', return_value=None):
+            self.assertEqual(engine._tool('ffmpeg'), str(portable.resolve()))
 
     def test_configuration_validation_is_atomic(self):
         previous = dict(self.engine.config)
@@ -131,8 +176,8 @@ class EngineTests(unittest.TestCase):
         def broken_path(command, **kwargs):
             return subprocess.CompletedProcess(command, 1 if command[0] == '/system/ffmpeg' else 0, Path(command[0]).stem + ' version 2', '')
         with patch('engine.shutil.which', side_effect=lambda name: '/system/' + name), patch('engine.subprocess.run', side_effect=broken_path):
-            self.assertEqual(self.engine.status()['tools']['ffmpeg']['path'], str(local))
-            self.assertEqual(self.engine._tool('ffmpeg'), str(local))
+            self.assertEqual(self.engine.status()['tools']['ffmpeg']['path'], str(local.resolve()))
+            self.assertEqual(self.engine._tool('ffmpeg'), str(local.resolve()))
 
     def test_status_concurrent_requests_share_one_probe_batch(self):
         entered, release = threading.Event(), threading.Event()
@@ -666,7 +711,7 @@ class EngineTests(unittest.TestCase):
                 self.assertTrue(any(result['settings']['effort'] == 'extra' for result in job['results']))
             else:
                 self.assertTrue(all(not result['fit'] for result in job['results']))
-                self.assertIn('Pinned settings were preserved', job['searchNote'])
+                self.assertIn('Locked settings were preserved', job['searchNote'])
 
     def test_diminishing_quality_returns_preserve_detail(self):
         score = self.engine._fidelity_score

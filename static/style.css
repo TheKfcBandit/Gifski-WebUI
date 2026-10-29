@@ -384,3 +384,21 @@ dialog h2 { margin:16px 0 24px; }
 @media(prefers-reduced-motion:reduce) {
   * { scroll-behavior:auto!important; transition:none!important; animation-duration:.01ms!important; animation-iteration-count:1!important; }
 }
+
+/* App-local presets and installation activity. */
+.preset-storage-status { margin:12px 0 0; }
+.file-label.disabled { opacity:.5; cursor:not-allowed; }
+.dependency-indicator { max-width:230px; padding:7px 10px; border:1px solid #a96a50; border-radius:5px; background:#ff795710; color:var(--accent2); font:10px/1.4 var(--mono); text-align:left; }
+.dependency-activity { position:sticky; top:0; z-index:2; border-color:#9a664e; padding:19px; box-shadow:0 6px 20px #0003; }
+.dependency-activity.failed { border-color:#a36557; }
+.dependency-activity progress { display:block; width:100%; height:6px; accent-color:var(--accent); margin:5px 0 0; }
+.dependency-activity .job-status-row { gap:8px; flex-wrap:wrap; }
+.dependency-activity .process-stats { margin:0; }
+.dependency-activity-actions { display:flex; gap:9px; flex-wrap:wrap; align-items:center; }
+@media(max-width:700px) { .dependency-indicator { max-width:155px; font-size:9px; padding:6px 8px; } .dependency-activity { position:static; } }
+@media(max-width:410px) { .dependency-indicator { max-width:120px; } .topbar-right { gap:6px; } }
+
+.setup-installation { margin:0 0 18px; padding:16px; border:1px solid #9a664e; border-radius:7px; background:#141b23; }
+.setup-installation strong { display:block; font-size:12px; margin-bottom:12px; }
+.setup-installation progress { display:block; width:100%; height:6px; accent-color:var(--accent); margin-bottom:10px; }
+.setup-installation .process-stats { margin:0; padding:0 0 5px; }

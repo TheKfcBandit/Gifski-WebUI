@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 
 GITHUB_RELEASE = 'https://api.github.com/repos/ImageOptim/gifski/releases/latest'
@@ -38,6 +39,11 @@ MAX_LICENSE_BYTES = 4 * 1024 * 1024
 MAX_ARCHIVE = 512 * 1024 * 1024
 MAX_EXPANDED = 1024 * 1024 * 1024
 MAX_EXECUTABLE = 512 * 1024 * 1024
+INSTALL_TIMEOUT_SECONDS = 20 * 60
+INSTALL_IDLE_SECONDS = 45
+INSTALL_SOCKET_TIMEOUT_SECONDS = 8
+INSTALL_CANCEL_GRACE_SECONDS = 20
+INSTALL_ACTIVE_STATES = ('queued', 'installing', 'cancelling')
 ALLOWED_HOSTS = frozenset({
     'api.github.com', 'github.com', 'release-assets.githubusercontent.com',
     'objects.githubusercontent.com', 'www.gyan.dev', 'gyan.dev', 'ffmpeg.org', 'www.ffmpeg.org',
@@ -68,15 +74,21 @@ def _open(url, timeout=30):
     return response
 
 
-def _read_small(url, limit=2 * 1024 * 1024):
+def _read_small(url, limit=2 * 1024 * 1024, check=None):
     deadline = time.monotonic() + 16
     data = bytearray()
+    if check:
+        check()
     with _open(url, timeout=8) as response:
         read = getattr(response, 'read1', response.read)
         while len(data) <= limit:
+            if check:
+                check()
             if time.monotonic() > deadline:
                 raise TimeoutError('The provider metadata request timed out.')
             block = read(min(65536, limit + 1 - len(data)))
+            if check:
+                check()
             if not block:
                 return bytes(data)
             data.extend(block)
@@ -88,6 +100,14 @@ class UpdateCheckError(ValueError):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+class InstallationCancelled(Exception):
+    pass
+
+
+class InstallationTimeout(TimeoutError):
+    pass
 
 
 def provider_error(error):
@@ -182,7 +202,7 @@ def _safe_name(name):
     return path
 
 
-def extract_executables(archive, staging, wanted):
+def extract_executables(archive, staging, wanted, check=None):
     """Copy only named regular binaries, retaining bounded license text separately."""
     staging = Path(staging)
     staged = {}
@@ -192,6 +212,8 @@ def extract_executables(archive, staging, wanted):
 
     def copy_entry(name, size, regular, opener):
         nonlocal expanded, license_bytes
+        if check:
+            check()
         path = _safe_name(name)
         expanded += size
         if size < 0 or expanded > MAX_EXPANDED:
@@ -214,6 +236,8 @@ def extract_executables(archive, staging, wanted):
         with opener() as source, destination.open('xb') as target:
             remaining = size
             while remaining:
+                if check:
+                    check()
                 block = source.read(min(1024 * 1024, remaining))
                 if not block:
                     raise ValueError('An executable in the archive is truncated.')
@@ -270,6 +294,12 @@ class DependencyManager:
         self.check_cached = False
         self.refresh_error = ''
         self.installed_tools = {}
+        self._operation = None
+        self._install_thread = None
+        self._closed = False
+        self.installation = {'id': None, 'state': 'idle', 'tool': None, 'phase': '', 'startedAt': None,
+                             'progress': 0, 'elapsedSeconds': 0, 'idleSeconds': 0, 'bytesReceived': 0, 'totalBytes': 0, 'bytesPerSecond': 0,
+                             'etaSeconds': None, 'canCancel': False, 'cleanupPending': False, 'message': '', 'error': None}
         self.setup = {'state': 'idle', 'remaining': [], 'message': ''}
         self.supported = platform.system() == 'Windows' and platform.machine().lower() in ('amd64', 'x86_64')
         self.tools = {name: {'state': 'idle', 'progress': 0, 'message': '', 'error': None,
@@ -285,6 +315,19 @@ class DependencyManager:
             updates = self._update_status()
             setup = copy.deepcopy(self.setup)
             installed = copy.deepcopy(self.installed_tools)
+            installation = copy.deepcopy(self.installation)
+            operation = self._operation
+            now = time.monotonic()
+            if operation and installation['state'] in INSTALL_ACTIVE_STATES:
+                installation['elapsedSeconds'] = round(max(0, now - operation['started']), 1)
+                installation['idleSeconds'] = round(max(0, now - operation['lastProgress']), 1)
+            for name, item in tools.items():
+                if operation and name in operation['names'] and item['state'] in INSTALL_ACTIVE_STATES:
+                    item['elapsedSeconds'] = round(max(0, now - operation['started']), 1)
+            busy = installation['cleanupPending'] or installation['state'] in INSTALL_ACTIVE_STATES or setup['state'] in INSTALL_ACTIVE_STATES or any(t['state'] in INSTALL_ACTIVE_STATES for t in tools.values())
+            pending = [name for name, item in tools.items() if item['state'] in INSTALL_ACTIVE_STATES]
+            affects_active = any(not installed.get(tool, {}).get('available') or self._is_portable_active(installed[tool])
+                                 for name in pending for tool in ([name] if name == 'gifski' else ['ffmpeg', 'ffprobe']))
         for name, item in tools.items():
             wanted = [name] if name == 'gifski' else ['ffmpeg', 'ffprobe']
             item['installed'] = all((self.root / 'bin' / f'{tool}.exe').is_file() for tool in wanted)
@@ -292,8 +335,8 @@ class DependencyManager:
             item['portableUpdateAffectsActive'] = all(
                 not installed.get(tool, {}).get('available') or self._is_portable_active(installed[tool]) for tool in wanted)
         return {'platform': f'{platform.system()} {platform.machine()}', 'supported': self.supported,
-                'busy': setup['state'] == 'installing' or any(t['state'] in ('queued', 'installing') for t in tools.values()),
-                'tools': tools, 'updates': updates, 'setup': setup, 'destination': 'bin/',
+                'busy': busy, 'blocksEncoding': busy and affects_active and not installation['cleanupPending'],
+                'tools': tools, 'updates': updates, 'setup': setup, 'installation': installation, 'destination': 'bin/',
                 'missing': [name for name in ('gifski', 'ffmpeg', 'ffprobe') if not installed.get(name, {}).get('available', False)],
                 'manual': {'gifski': 'Install Gifski from its official releases, or run brew install gifski on macOS. Then select its path in Engine settings.',
                            'ffmpeg': 'Install FFmpeg and FFprobe with your OS package manager, or select existing executable paths in Engine settings.'}}
@@ -534,19 +577,12 @@ class DependencyManager:
             self.check_state = 'completed' if not self.release_errors else ('partial' if self.release_cache else 'failed')
             self.check_phase = ''
 
-    def install(self, tool):
-        if tool not in self.tools:
+    def install(self, tool, installed_tools=None):
+        if not isinstance(tool, str) or tool not in self.tools:
             raise ValueError('Choose gifski or ffmpeg.')
         if not self.supported:
             raise ValueError('Automatic portable installation is available for Windows x64. Use the manual instructions on this platform.')
-        with self.lock:
-            if self.setup['state'] == 'installing' or any(t['state'] in ('queued', 'installing') for t in self.tools.values()):
-                raise ValueError('A dependency installation is already running.')
-            self.tools[tool].update(state='installing', progress=0, error=None, message='Checking the provider release…')
-        try:
-            threading.Thread(target=self._install_worker, args=(tool,), daemon=True, name=f'install-{tool}').start()
-        except RuntimeError:
-            self._update(tool, state='failed', error='Could not start installation. Try again.', message='Installation did not start.')
+        self._start_install([tool], installed_tools, batch=False)
         return self.status()
 
     def install_missing(self, installed_tools):
@@ -554,46 +590,192 @@ class DependencyManager:
         if not self.supported:
             raise ValueError('Automatic portable installation is available for Windows x64. Use the manual instructions on this platform.')
         with self.lock:
-            if self.setup['state'] == 'installing' or any(t['state'] in ('queued', 'installing') for t in self.tools.values()):
-                raise ValueError('A dependency installation is already running.')
+            self._assert_install_ready()
             self.installed_tools = copy.deepcopy(installed_tools)
             queue = []
             if not installed_tools.get('gifski', {}).get('available'):
                 queue.append('gifski')
             if not all(installed_tools.get(name, {}).get('available') for name in ('ffmpeg', 'ffprobe')):
                 queue.append('ffmpeg')
-            self.setup = {'state': 'installing' if queue else 'completed', 'remaining': list(queue),
-                          'message': 'Installing missing tools into bin/…' if queue else 'All required tools are already available.'}
-            for name in queue:
-                self.tools[name].update(state='queued', progress=0, error=None, message='Waiting to install locally…')
-        if queue:
-            try:
-                threading.Thread(target=self._install_missing_worker, args=(queue,), daemon=True, name='setup-dependencies').start()
-            except RuntimeError:
-                with self.lock:
-                    for name in queue:
-                        self.tools[name].update(state='failed', error='Could not start installation. Try again.', message='Installation did not start.')
-                    self.setup.update(state='failed', remaining=[], message='Could not start setup. Try again.')
+            if queue:
+                self._start_install(queue, installed_tools, batch=True)
+            else:
+                self.setup = {'state': 'completed', 'remaining': [], 'message': 'All required tools are already available.'}
         return self.status()
 
     def _install_missing_worker(self, queue):
-        for name in queue:
-            self._update(name, state='installing', message='Checking the provider release…')
-            self._install_worker(name)
-            with self.lock:
-                self.setup['remaining'] = [tool for tool in self.setup['remaining'] if tool != name]
+        self._run_installation(queue)
+
+    def _assert_install_ready(self):
+        if self._closed:
+            raise ValueError('The app is shutting down. Restart it before installing tools.')
+        if (self._install_thread is not None and self._install_thread.is_alive()) or self.status()['busy']:
+            raise ValueError('A dependency installation is already running or finishing cleanup.')
+
+    def _start_install(self, names, installed_tools=None, batch=False):
         with self.lock:
-            succeeded = sum(self.tools[name]['state'] == 'completed' for name in queue)
-            state = 'completed' if succeeded == len(queue) else ('partial' if succeeded else 'failed')
-            message = ('Missing tools were installed locally. Existing PATH and configured tools keep priority.' if state == 'completed'
-                       else 'Some tools could not be installed. Review the tool messages and retry setup.')
-            self.setup.update(state=state, remaining=[], message=message)
+            self._assert_install_ready()
+            if installed_tools is not None:
+                self.installed_tools = copy.deepcopy(installed_tools)
+            started = time.monotonic()
+            operation = {'id': uuid.uuid4().hex, 'names': list(names), 'batch': batch, 'cancel': threading.Event(),
+                         'done': threading.Event(), 'started': started, 'lastProgress': started,
+                         'abortAt': None, 'failure': None, 'publishing': False}
+            self._operation = operation
+            self.installation.update(id=operation['id'], state='installing', tool=names[0], phase='metadata',
+                                     startedAt=time.time(), progress=0, elapsedSeconds=0, idleSeconds=0, bytesReceived=0, totalBytes=0,
+                                     bytesPerSecond=0, etaSeconds=None, canCancel=True, cleanupPending=False,
+                                     message='Starting dependency installation…', error=None)
+            self.setup = {'state': 'installing' if batch else 'idle', 'remaining': list(names) if batch else [],
+                          'message': 'Installing missing tools into bin/…' if batch else ''}
+            for name in names:
+                self.tools[name].update(state='queued', progress=0, error=None, message='Waiting to install locally…',
+                                        phase='queued', startedAt=self.installation['startedAt'], elapsedSeconds=0,
+                                        bytesReceived=0, totalBytes=0, bytesPerSecond=0, etaSeconds=None)
+        worker = None
+        try:
+            worker = threading.Thread(target=self._run_installation, args=(list(names),), daemon=True, name='install-dependencies')
+            with self.lock:
+                self._install_thread = worker
+            worker.start()
+            threading.Thread(target=self._watch_installation, args=(operation,), daemon=True, name='watch-dependencies').start()
+        except RuntimeError:
+            if worker is None or not worker.is_alive():
+                with self.lock:
+                    for name in names:
+                        self.tools[name].update(state='failed', error='Could not start installation. Try again.', message='Installation did not start.')
+                    self.installation.update(state='failed', canCancel=False, phase='', error='Could not start installation.', message='Installation did not start.')
+                    if batch:
+                        self.setup.update(state='failed', remaining=[], message='Could not start setup. Try again.')
+                    operation['done'].set()
+            # A watcher failure does not abort a working installer: every I/O
+            # loop also enforces cancellation and deadlines itself.
+
+    def cancel(self):
+        """Nonblocking cancellation. HTTP/socket closure belongs to the worker."""
+        with self.lock:
+            operation = self._operation
+            if operation and not operation['done'].is_set():
+                operation['cancel'].set()
+                operation['abortAt'] = operation['abortAt'] or time.monotonic()
+                self.installation.update(state='cancelling', canCancel=False, message='Cancelling installation and removing temporary files…')
+                for name in operation['names']:
+                    if self.tools[name]['state'] in INSTALL_ACTIVE_STATES:
+                        self.tools[name].update(state='cancelling', message='Cancelling installation…')
+                if operation['batch']:
+                    self.setup.update(state='cancelling', message='Cancelling setup…')
+        return self.status()
+
+    def close(self, timeout=2):
+        """Bounded server shutdown; an interrupted worker can never publish later."""
+        with self.lock:
+            self._closed = True
+            worker = self._install_thread
+        self.cancel()
+        if worker is not None and worker is not threading.current_thread() and worker.is_alive():
+            worker.join(max(0, min(float(timeout), 5)))
+
+    def _checkpoint(self, tool=None, progress=False):
+        with self.lock:
+            operation = self._operation
+            if not operation:
+                return
+            now = time.monotonic()
+            if not operation['cancel'].is_set():
+                if now - operation['started'] >= INSTALL_TIMEOUT_SECONDS:
+                    operation['failure'] = 'Installation exceeded the 20-minute limit. Retry on a faster connection or install manually.'
+                elif now - operation['lastProgress'] >= INSTALL_IDLE_SECONDS:
+                    operation['failure'] = 'Installation made no progress for 45 seconds. Check the connection and retry.'
+                if operation['failure']:
+                    operation['cancel'].set()
+                    operation['abortAt'] = now
+            if operation['cancel'].is_set():
+                if operation['failure']:
+                    raise InstallationTimeout(operation['failure'])
+                raise InstallationCancelled('Installation cancelled.')
+            if progress:
+                operation['lastProgress'] = now
+
+    def _phase(self, tool, phase, message, **values):
+        self._checkpoint(tool, progress=True)
+        with self.lock:
+            self.tools[tool].update(phase=phase, message=message, **values)
+            self.installation.update(tool=tool, phase=phase, message=message, **values)
+
+    def _watch_installation(self, operation):
+        while not operation['done'].wait(0.5):
+            try:
+                self._checkpoint()
+            except (InstallationCancelled, InstallationTimeout):
+                pass
+            with self.lock:
+                if self._operation is not operation:
+                    return
+                if operation['cancel'].is_set():
+                    self.installation.update(state='cancelling', canCancel=False, message='Stopping installation and cleaning up…')
+                    # OS DNS/file I/O can occasionally ignore socket deadlines.
+                    # Before publication it is safe to release encoding while
+                    # the cancelled worker finishes staging cleanup. No new
+                    # installer may start until that worker actually exits.
+                    if (operation['abortAt'] is not None and not operation['publishing']
+                            and time.monotonic() - operation['abortAt'] >= INSTALL_CANCEL_GRACE_SECONDS):
+                        state = 'failed' if operation['failure'] else 'cancelled'
+                        message = operation['failure'] or 'Installation cancelled. Temporary-file cleanup is still finishing.'
+                        for name in operation['names']:
+                            if self.tools[name]['state'] in INSTALL_ACTIVE_STATES:
+                                self.tools[name].update(state=state, message=message, error=operation['failure'])
+                        self.installation.update(state=state, cleanupPending=True, phase='cleanup', message=message, error=operation['failure'])
+                        if operation['batch']:
+                            self.setup.update(state=state, remaining=[], message=message)
+                        return
+
+    def _run_installation(self, names):
+        operation = self._operation
+        try:
+            for name in names:
+                self._checkpoint(name)
+                self._update(name, state='installing')
+                self._phase(name, 'metadata', 'Checking the provider release…', progress=0, bytesReceived=0, totalBytes=0, bytesPerSecond=0, etaSeconds=None)
+                self._install_worker(name)
+                with self.lock:
+                    self.setup['remaining'] = [tool for tool in self.setup['remaining'] if tool != name]
+        except (InstallationCancelled, InstallationTimeout):
+            pass
+        except BaseException:
+            # Even an unexpected worker exit must release the operation gate.
+            with self.lock:
+                operation['failure'] = 'Installation stopped unexpectedly. Retry setup or install the tools manually.'
+                operation['cancel'].set()
+        finally:
+            with self.lock:
+                cancelled = operation['cancel'].is_set()
+                for name in names:
+                    self.tools[name]['elapsedSeconds'] = round(max(0, time.monotonic() - operation['started']), 1)
+                    if self.tools[name]['state'] in INSTALL_ACTIVE_STATES:
+                        state = 'failed' if operation['failure'] or not cancelled else 'cancelled'
+                        self.tools[name].update(state=state, error=operation['failure'], message=operation['failure'] or 'Installation cancelled. Temporary files removed.')
+                succeeded = sum(self.tools[name]['state'] == 'completed' for name in names)
+                state = 'completed' if succeeded == len(names) else (
+                    ('failed' if operation['failure'] else 'cancelled') if cancelled else 'partial' if succeeded else 'failed')
+                message = ('Installed locally. Existing PATH and configured tools keep priority.' if state == 'completed'
+                           else ('Setup cancelled. Completed tool installations were kept.' if succeeded else 'Installation cancelled. Temporary files removed.') if state == 'cancelled'
+                           else operation['failure'] or 'Installation did not complete. Review the tool error and retry.')
+                errors = [self.tools[name].get('error') for name in names if self.tools[name].get('error')]
+                self.installation.update(state=state, phase='', canCancel=False, cleanupPending=False,
+                                         elapsedSeconds=round(max(0, time.monotonic() - operation['started']), 1),
+                                         bytesPerSecond=0, etaSeconds=None, message=message,
+                                         error=operation['failure'] or (errors[0] if errors else None))
+                if state == 'completed':
+                    self.installation['progress'] = 100
+                if operation['batch']:
+                    self.setup.update(state=state, remaining=[], message=message)
+                operation['done'].set()
 
     def _metadata(self, tool):
         if tool == 'ffmpeg':
-            digest = checksum(_read_small(FFMPEG_URL + '.sha256', 4096).decode('ascii'))
+            digest = checksum(_read_small(FFMPEG_URL + '.sha256', 4096, check=lambda: self._checkpoint(tool)).decode('ascii'))
             return FFMPEG_URL, digest, ['ffmpeg.exe', 'ffprobe.exe']
-        release = json.loads(_read_small(GITHUB_RELEASE))
+        release = json.loads(_read_small(GITHUB_RELEASE, check=lambda: self._checkpoint(tool)))
         assets = [a for a in release.get('assets', [])
                   if re.fullmatch(r'gifski-[0-9][A-Za-z0-9.\-]*\.(?:tar\.xz|zip)', a.get('name', ''))]
         if len(assets) != 1:
@@ -610,16 +792,18 @@ class DependencyManager:
     def _download(self, tool, url, destination, digest):
         h = hashlib.sha256()
         received = 0
-        deadline = time.monotonic() + 1800
-        with _open(url) as response, destination.open('xb') as target:
+        started = time.monotonic()
+        self._phase(tool, 'download', 'Connecting to the download provider…', bytesReceived=0, totalBytes=0, bytesPerSecond=0, etaSeconds=None)
+        with _open(url, timeout=INSTALL_SOCKET_TIMEOUT_SECONDS) as response, destination.open('xb') as target:
             total = int(response.headers.get('Content-Length') or 0)
             if total < 0 or total > MAX_ARCHIVE:
                 raise ValueError('The dependency download exceeds the size limit.')
+            self._phase(tool, 'download', 'Downloading portable tools…', totalBytes=total)
             read = getattr(response, 'read1', response.read)
             while True:
-                if time.monotonic() > deadline:
-                    raise ValueError('The dependency download timed out.')
-                data = read(1024 * 1024)
+                self._checkpoint(tool)
+                data = read(256 * 1024)
+                self._checkpoint(tool)
                 if not data:
                     break
                 received += len(data)
@@ -628,7 +812,10 @@ class DependencyManager:
                 h.update(data)
                 target.write(data)
                 progress = 5 + int(65 * received / total) if total else 10
-                self._update(tool, progress=min(progress, 70), message=f'Downloading: {received / 1048576:.1f} MiB')
+                rate = received / max(0.01, time.monotonic() - started)
+                self._phase(tool, 'download', f'Downloading: {received / 1048576:.1f} MiB',
+                            progress=min(progress, 70), bytesReceived=received, totalBytes=total,
+                            bytesPerSecond=round(rate), etaSeconds=round(max(0, total - received) / rate, 1) if total and rate else None)
         if not received or (total and received != total):
             raise ValueError('The dependency download was incomplete.')
         if h.hexdigest() != digest:
@@ -648,11 +835,13 @@ class DependencyManager:
         installed = []
         try:
             for name, path in binaries.items():
+                self._checkpoint(tool, progress=True)
                 target = destination / name
                 if target.exists():
                     shutil.copy2(target, backup / name)
                 os.replace(path, target)
                 installed.append(name)
+                self._checkpoint(tool, progress=True)
             licenses = staging / 'licenses'
             if licenses.is_dir():
                 license_target = destination / 'licenses' / tool
@@ -661,6 +850,7 @@ class DependencyManager:
                     raise ValueError('The dependency license destination must not contain symbolic links.')
                 license_target.mkdir(parents=True, exist_ok=True)
                 for path in licenses.iterdir():
+                    self._checkpoint(tool, progress=True)
                     shutil.copy2(path, license_target / path.name)
         except Exception:
             for name in reversed(installed):
@@ -672,7 +862,10 @@ class DependencyManager:
             raise
 
     def _install_worker(self, tool):
+        published = False
+        versions = []
         try:
+            self._checkpoint(tool)
             destination = self.root / 'bin'
             if destination.is_symlink():
                 raise ValueError('The app bin folder must not be a symbolic link.')
@@ -680,14 +873,17 @@ class DependencyManager:
             with tempfile.TemporaryDirectory(prefix='.install-', dir=destination) as temp:
                 staging = Path(temp)
                 url, digest, wanted = self._metadata(tool)
+                self._checkpoint(tool, progress=True)
                 archive = staging / 'download.archive'
                 self._download(tool, url, archive, digest)
-                self._update(tool, progress=75, message='Checksum verified. Unpacking portable binaries…')
-                binaries = extract_executables(archive, staging, wanted)
-                versions = []
+                self._phase(tool, 'extract', 'Checksum verified. Unpacking portable binaries…', progress=75, bytesPerSecond=0, etaSeconds=None)
+                binaries = extract_executables(archive, staging, wanted, check=lambda: self._checkpoint(tool, progress=True))
+                self._phase(tool, 'verify', 'Checking the downloaded executables…', progress=85)
                 for name, path in binaries.items():
+                    self._checkpoint(tool, progress=True)
                     flag = '--version' if name == 'gifski.exe' else '-version'
                     result = subprocess.run([str(path), flag], capture_output=True, text=True, errors='replace', timeout=15)
+                    self._checkpoint(tool, progress=True)
                     if result.returncode:
                         raise ValueError(f'{name} could not run on this machine. Nothing was installed.')
                     output = (result.stdout + result.stderr).strip()
@@ -695,15 +891,42 @@ class DependencyManager:
                     if not output.lower().startswith(expected + ' '):
                         raise ValueError(f'{name} did not report the expected version identity. Nothing was installed.')
                     versions.append(output.splitlines()[0] if output else name)
-                self._update(tool, progress=95, message='Installing in the app folder…')
+                self._phase(tool, 'publish', 'Installing in the app folder…', progress=95)
+                with self.lock:
+                    self._checkpoint(tool)
+                    if self._operation:
+                        self._operation['publishing'] = True
                 self._publish(tool, binaries, staging)
-                self._update(tool, state='completed', progress=100, version='; '.join(versions), message='Installed locally. No system settings were changed.')
+                published = True
+                # Keep the operation gate closed through staging cleanup and
+                # detection invalidation, so the next job cannot use stale paths.
             if self.on_change:
                 self.on_change()
+            self._update(tool, state='completed', progress=100, version='; '.join(versions), phase='', message='Installed locally. No system settings were changed.')
         except Exception as error:
+            if published:
+                self._update(tool, state='completed', progress=100, version='; '.join(versions), phase='',
+                             error='The files were installed, but final cleanup or tool detection refresh failed. Scan tools before exporting.',
+                             message='Portable tools were installed. A final refresh needs attention.')
+                return
             # Avoid returning signed redirect URLs from urllib errors.
-            if isinstance(error, (urllib.error.URLError, ssl.SSLError, TimeoutError, socket.gaierror)):
+            with self.lock:
+                operation = self._operation
+                if operation and operation['cancel'].is_set() and not operation['failure'] and not operation['publishing']:
+                    error = InstallationCancelled('Installation cancelled.')
+            cancelled = isinstance(error, InstallationCancelled)
+            if isinstance(error, InstallationTimeout):
+                message = str(error)
+            elif cancelled:
+                message = 'Installation cancelled. Temporary files removed.'
+            elif isinstance(error, (urllib.error.URLError, ssl.SSLError, TimeoutError, socket.gaierror)):
                 message = provider_error(error)['message']
             else:
                 message = str(error)
-            self._update(tool, state='failed', error=message, message='Installation failed. Existing executable paths are unchanged.')
+            self._update(tool, state='cancelled' if cancelled else 'failed', error=None if cancelled else message,
+                         phase='', bytesPerSecond=0, etaSeconds=None,
+                         message=message if cancelled else 'Installation failed. Review the error and retry.')
+        finally:
+            with self.lock:
+                if self._operation:
+                    self._operation['publishing'] = False

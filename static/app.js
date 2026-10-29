@@ -12,17 +12,17 @@
     smart:{targetMB:20,effort:'balanced',pinResolution:false,pinFps:false},performance:{threads:0,hardwareDecode:'none'}
   };
   const builtinPresets = [
-    {id:'balanced',name:'Balanced',icon:'◈',description:'A versatile balance of detail, motion, and size.',settings:{width:640,fps:20,quality:90}},
-    {id:'small',name:'Compact',icon:'◧',description:'Smaller dimensions and fewer frames, with room to tune quality upward.',settings:{width:480,fps:15,quality:75}},
-    {id:'quality',name:'Fidelity',icon:'✳',description:'High detail and extra effort. Expect large files; compare with normal effort.',settings:{width:960,fps:25,quality:100,effort:'extra'}},
-    {id:'ui',name:'UI & text',icon:'⌘',description:'Crisp interface details with a moderate frame rate. Inspect small text closely.',settings:{width:800,fps:15,quality:95,effort:'extra'}},
-    {id:'motion',name:'Motion',icon:'≋',description:'More frames for fast action. Check GIF timing and the measured size.',settings:{width:640,fps:30,quality:90,motionQuality:95}},
-    {id:'alpha',name:'Transparent',icon:'▦',description:'PNG preparation preserves alpha. GIF can only keep fully opaque or transparent pixels.',settings:{width:640,fps:20,quality:95,pipeline:'png'}}
+    {id:'balanced',name:'Balanced',icon:'◈',description:'General-purpose preset with normal encoding effort.',settings:{width:640,fps:20,quality:90}},
+    {id:'small',name:'Compact',icon:'◧',description:'Reduced resolution, frame rate, and quality.',settings:{width:480,fps:15,quality:75}},
+    {id:'quality',name:'Fidelity',icon:'✳',description:'Higher resolution and quality with extra encoding effort.',settings:{width:960,fps:25,quality:100,effort:'extra'}},
+    {id:'ui',name:'UI & text',icon:'⌘',description:'Higher quality and moderate frame rate for text and interface content.',settings:{width:800,fps:15,quality:95,effort:'extra'}},
+    {id:'motion',name:'Motion',icon:'≋',description:'Higher frame rate and motion quality.',settings:{width:640,fps:30,quality:90,motionQuality:95}},
+    {id:'alpha',name:'Transparent',icon:'▦',description:'PNG preparation preserves alpha. GIF supports one-bit transparency.',settings:{width:640,fps:20,quality:95,pipeline:'png'}}
   ];
   const modes = [
-    {id:'default',name:'Default',icon:'◈',description:'Choose a ready-made recipe, trim your clip, and encode.'},
-    {id:'smart',name:'Smart',icon:'✦',description:'Find the best tested quality within your size limit. Pin settings you want to keep.'},
-    {id:'advanced',name:'Advanced',icon:'⚙',description:'Set every encoder option yourself, then save a reusable recipe.'}
+    {id:'default',name:'Default',icon:'◈',description:'Apply a built-in or saved preset.'},
+    {id:'smart',name:'Smart',icon:'✦',description:'Search encoding settings under a size limit. Resolution and FPS can be locked.'},
+    {id:'advanced',name:'Advanced',icon:'⚙',description:'Configure all encoding and preprocessing parameters.'}
   ];
   let settings=clone(defaults), toolsState=null, metadata=null, jobs=[], currentJob=null;
   let selectedMode='default', selectedPreset='balanced', pollBusy=false, submitting=false, uploadBusy=false, sourceLoading=false;
@@ -31,11 +31,10 @@
   let latestEstimateJob=null, estimatePendingId=null, wakeLock=null, wakeRequestPending=false, wakeDenied=false;
   const jobRevisions=new Map();
   const sourceMatches=new Map(), toolDrafts=new Map();
-  let dependencyState=null, dependencyPoll=null, dependencyBusy=false, setupChecked=false;
-  let customPresets=[];
-  try { const stored=JSON.parse(localStorage.getItem('gifski-workbench-presets')||'[]');
-    if(Array.isArray(stored))customPresets=stored.slice(0,100).flatMap(item=>{try{return [validateImported(item,true)];}catch{return [];}});
-  } catch { customPresets=[]; }
+  let dependencyState=null,dependencyPoll=null,dependencyBusy=false,setupChecked=false,dependencyCardSignature='';
+  let dependencyStarting=false,dependencyCancelPending=false,dependencyConnectionError='',installationOverride=null,dismissedInstallationId=null;
+  let customPresets=[],appRevision=null,appStateReady=false,appStateBusy=false,appPreferences={keepAwake:false};
+  const legacyPresetKey='gifski-workbench-presets';
   function presetId(){return 'custom-'+(globalThis.crypto?.randomUUID?.()||Date.now().toString(36)+'-'+Math.random().toString(36).slice(2));}
   const adaptive=()=>selectedMode==='smart';
   const get=(obj,key)=>key.split('.').reduce((a,k)=>a?.[k],obj);
@@ -50,7 +49,7 @@
     try{
       const response=await fetch(path,{credentials:'same-origin',...(body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),...options,signal:controller.signal});
       const type=response.headers.get('content-type')||'',data=type.includes('json')?await response.json():{error:await response.text()};
-      if(!response.ok)throw new Error(data.error||data.message||`Request failed (${response.status})`);return data;
+      if(!response.ok){const error=new Error(data.error||data.message||`Request failed (${response.status})`);error.httpStatus=response.status;throw error;}return data;
     }catch(error){if(error.name==='AbortError')throw new Error('The local server took too long to respond. Keep the launcher window open; a running job may still be working.');throw error;}
     finally{clearTimeout(timer);}
   }
@@ -64,7 +63,7 @@
   function syncTarget(){
     const target=Number(settings.smart.targetMB),valid=Number.isFinite(target)&&target>=0.01&&target<=100000;
     $('targetRange').max=valid?Math.max(50,target):50;$('targetRange').value=valid?target:0.01;
-    $('targetRange').setAttribute('aria-valuetext',valid?`${target} megabytes`:'Choose a valid size limit');
+    $('targetRange').setAttribute('aria-valuetext',valid?`${target} megabytes`:'Enter a valid size limit');
     $$('[data-target-mb]').forEach(node=>node.setAttribute('aria-pressed',String(valid&&Number(node.dataset.targetMb)===target)));
   }
   function syncFields(){
@@ -91,9 +90,9 @@
     $('effortHint').textContent={normal:'Gifski’s default mode, without an effort flag. Normal balances encoding time and fidelity.',extra:'Uses Gifski’s --extra flag. Prioritizes fidelity and usually creates larger files.',fast:'Uses Gifski’s --fast flag. Faster, with lower fidelity and typically larger files than normal.'}[settings.effort];
     const dim=settings.width?`${settings.width}${settings.height?' × '+settings.height:''} px`:settings.height?`${settings.height} px high`:'Auto dimensions';
     const recipe=`${dim} · ${settings.fps} fps · Q${settings.quality}`;
-    $('recipeSummary').textContent=auto?`Smart · ≤ ${settings.smart.targetMB||'—'} MB${settings.smart.pinResolution?' · resolution pinned':''}${settings.smart.pinFps?' · '+settings.fps+' fps pinned':''}`:recipe;
+    $('recipeSummary').textContent=auto?`Smart · ≤ ${settings.smart.targetMB||'—'} MB${settings.smart.pinResolution?' · resolution locked':''}${settings.smart.pinFps?' · '+settings.fps+' fps locked':''}`:recipe;
     $('presetOverviewRecipe').textContent=recipe;$('presetOverviewTitle').textContent=preset?.name||'Current settings';
-    $('presetOverviewDescription').textContent=preset?.description||(preset?'Your saved recipe is ready. Open Advanced to inspect or edit every option.':'Your current settings are preserved. Choose a recipe or open Advanced to fine-tune them.');
+    $('presetOverviewDescription').textContent=preset?.description||(preset?'Saved preset loaded. Advanced exposes all parameters.':'Current settings retained. Select a preset or edit parameters in Advanced.');
     $('presetHint').textContent=modes.find(mode=>mode.id===selectedMode)?.description||'';
     const extra=[settings.crop.enabled?'crop':null,settings.reverse?'reverse':null,settings.denoise?'denoise':null,settings.sharpen?'sharpen':null,settings.customFilter?'custom filters':null,settings.fixedColors.length?'fixed colors':null,settings.matte?'matte':null,!['auto','png'].includes(settings.pipeline)?settings.pipeline+' input':null].filter(Boolean);
     $('processingSummary').hidden=!extra.length||manual;$('processingSummary').textContent=`Also active: ${extra.join(', ')} · Edit in Advanced`;
@@ -102,16 +101,17 @@
     $('resolutionPinFields').hidden=!settings.smart.pinResolution;$('fpsPinFields').hidden=!settings.smart.pinFps;
     $('smartWidth').disabled=$('smartHeight').disabled=!auto||!settings.smart.pinResolution;$('smartFps').disabled=!auto||!settings.smart.pinFps;
     $('field-width').disabled=$('field-height').disabled=$('field-fps').disabled=auto;
-    $('smartStrategy').textContent=settings.smart.pinResolution&&settings.smart.pinFps?'Resolution and frame rate stay fixed. Smart adjusts quality; a tight limit can have no fitting result.':settings.smart.pinResolution?'Resolution stays fixed. Smart balances frame rate and quality, then measures complete GIFs.':settings.smart.pinFps?'Frame rate stays fixed. Smart balances dimensions and quality, then measures complete GIFs.':'Short samples guide dimensions, motion, and quality. Only complete, measured outputs can pass the limit.';
+    $('smartStrategy').textContent=settings.smart.pinResolution&&settings.smart.pinFps?'Resolution and FPS are locked. Only quality is searched. The size limit may be unattainable.':settings.smart.pinResolution?'Resolution is locked. FPS and quality are searched; complete outputs verify the size limit.':settings.smart.pinFps?'FPS is locked. Resolution and quality are searched; complete outputs verify the size limit.':'Sample encodes guide resolution, FPS, and quality. Complete outputs verify the size limit.';
     $('sequenceRateField').hidden=settings.source.kind!=='sequence'||manual||(auto&&settings.smart.pinFps);
     const rawDuration=metadata?.duration??metadata?.format?.duration;
     const duration=rawDuration!=null?Number(rawDuration):settings.source.kind==='sequence'&&metadata?.frameCount?metadata.frameCount/settings.fps:NaN;
     const start=Number(settings.trim.start)||0,end=settings.trim.end==null?duration:Number(settings.trim.end);
     if(sourceExists()&&Number.isFinite(end)&&end>start){const out=(end-start)/settings.speed*(settings.bounce?2:1);$('durationSummary').textContent=`≈ ${seconds(out)}${!auto?' · '+Math.ceil(out*settings.fps)+' frames':''}${settings.bounce?' · bounce':''}`;}
-    else $('durationSummary').textContent=sourceExists()?'Ready to encode':'Load a clip to begin';
-    $('estimateJob').hidden=auto;$('estimateJob').disabled=!sourceExists()||submitting||uploadBusy||sourceLoading||!!estimatePendingId;
-    $('runJob').disabled=!sourceExists()||submitting||uploadBusy||sourceLoading;
-    $('runJob').replaceChildren(document.createTextNode(auto?'Find best fit':'Encode GIF'),el('span','', '↗'));
+    else $('durationSummary').textContent=sourceExists()?'Ready to encode':'No source loaded';
+    $('estimateJob').hidden=auto;$('estimateJob').disabled=!sourceExists()||submitting||uploadBusy||sourceLoading||!!estimatePendingId||!!dependencyState?.blocksEncoding;
+    $('runJob').disabled=!sourceExists()||submitting||uploadBusy||sourceLoading||!!dependencyState?.blocksEncoding;
+    $('runJob').title=dependencyState?.blocksEncoding?'Dependency installation is modifying an active executable.':'';
+    $('runJob').replaceChildren(document.createTextNode(auto?'Optimize GIF':'Encode GIF'),el('span','', '↗'));
     const canMark=!!$('sourceVideo').getAttribute('src')&&!$('sourceVideo').hidden;
     $('markStart').disabled=!canMark;$('markEnd').disabled=!canMark;
   }
@@ -125,7 +125,7 @@
     if(!$('modeSelector').children.length)$('modeSelector').replaceChildren(...modes.map(mode=>{const node=button('','preset-card',()=>selectMode(mode.id));node.dataset.mode=mode.id;node.append(el('span','preset-icon',mode.icon),el('span','',mode.name));return node;}));
     const groups=[['Built-in recipes',builtinPresets],['Saved recipes',customPresets]],options=[];
     for(const [label,recipes] of groups){if(!recipes.length)continue;const group=el('optgroup');group.label=label;for(const preset of recipes){const option=el('option','',preset.name+(preset.mode==='smart'?' · Smart':''));option.value=preset.id;group.append(option);}options.push(group);}
-    $('recipeSelect').replaceChildren(...options);renderPresetSelection();
+    $('recipeSelect').replaceChildren(...options);renderPresetSelection();updatePresetStorageControls();
   }
   function selectMode(mode){
     if(!modes.some(item=>item.id===mode)||selectedMode===mode)return;
@@ -139,7 +139,56 @@
     for(const key of ['crop','smart','performance'])settings[key]={...(key==='smart'&&builtin?smart:defaults[key]),...p.settings[key]};
     selectedMode=mode||(p.mode==='smart'?'smart':'default');selectedPreset=p.id||null;sourceMatches.clear();recipeRevision++;syncFields();schedulePlan();
   }
-  function persistPresets(){try{localStorage.setItem('gifski-workbench-presets',JSON.stringify(customPresets));}catch{throw new Error('Could not save in browser storage. Export the recipe to keep it.');}}
+  function updatePresetStorageControls(){
+    const disabled=!appStateReady||appStateBusy;
+    for(const id of ['savePreset','confirmPreset','deletePreset','importPreset','importBrowserPresets'])$(id).disabled=disabled;
+    $('importPreset').parentElement.classList.toggle('disabled',disabled);$('presetName').disabled=appStateBusy;$('cancelPreset').disabled=appStateBusy;
+    $('keepAwake').disabled=disabled||!('wakeLock' in navigator);$('reloadPresets').disabled=appStateBusy;
+    $('presetDialog').setAttribute('aria-busy',String(appStateBusy));
+  }
+  function acceptAppState(data){
+    if(!Array.isArray(data.presets)||typeof data.revision!=='string')throw new Error('Invalid app preset response.');
+    customPresets=data.presets.map(item=>validateImported(item,true));appRevision=data.revision;appStateReady=true;
+    appPreferences={keepAwake:data.preferences?.keepAwake===true};$('keepAwake').checked=appPreferences.keepAwake;updateWakeLock();
+    if(selectedPreset&&!builtinPresets.some(item=>item.id===selectedPreset)&&!customPresets.some(item=>item.id===selectedPreset))selectedPreset=null;
+    renderPresets();updateRecipe();$('reloadPresets').hidden=true;setText('presetStorageStatus',`${customPresets.length} saved ${customPresets.length===1?'preset':'presets'} · app-folder storage`);
+  }
+  async function refreshPresets(){
+    try{acceptAppState(await api('/api/presets',undefined,{timeoutMs:15000}));}
+    catch(error){appStateReady=false;setText('presetStorageStatus','Preset storage unavailable: '+error.message);$('reloadPresets').hidden=false;throw error;}
+    finally{updatePresetStorageControls();}
+  }
+  async function persistPresets(next){
+    if(!appStateReady)throw new Error('Load app preset storage before saving.');if(appStateBusy)throw new Error('An app settings update is already pending.');
+    appStateBusy=true;updatePresetStorageControls();setText('presetStorageStatus','Saving presets…');
+    try{const data=await api('/api/presets',{presets:next,revision:appRevision});acceptAppState(data);return customPresets;}
+    catch(error){if(error.httpStatus===409){await refreshPresets();throw new Error('Presets changed in another window. Current app presets were reloaded; retry the operation.');}setText('presetStorageStatus','Preset save failed: '+error.message);throw error;}
+    finally{appStateBusy=false;updatePresetStorageControls();}
+  }
+  function inspectBrowserPresets(){
+    let present=false,count=null,message='No legacy browser presets detected.';
+    try{const raw=localStorage.getItem(legacyPresetKey);present=!!raw&&raw!=='[]';if(present){try{const items=JSON.parse(raw);if(Array.isArray(items))count=items.length;}catch{}message=count!==null?`${count} legacy browser ${count===1?'preset':'presets'} available. Import copies them into this app folder, then removes the browser copy.`:'Legacy browser data detected. It has not been loaded into this app.';}}
+    catch{message='Browser storage is inaccessible. App-folder presets are unaffected.';}
+    $('importBrowserPresets').hidden=$('clearBrowserPresets').hidden=!present;setText('legacyPresetStatus',message);
+  }
+  async function importBrowserPresets(){
+    const raw=localStorage.getItem(legacyPresetKey);if(!raw)throw new Error('No browser presets found.');if(raw.length>2000000)throw new Error('Browser preset data exceeds the import limit.');
+    const items=JSON.parse(raw);if(!Array.isArray(items)||items.length>100)throw new Error('Invalid browser preset collection.');
+    const incoming=items.map(item=>validateImported(item)),next=customPresets.slice(),signature=item=>JSON.stringify([item.name,item.mode,item.settings]);
+    const existing=new Set(next.map(signature));for(const item of incoming){const key=signature(item);if(!existing.has(key)){next.push(item);existing.add(key);}}
+    if(next.length>100)throw new Error('Import would exceed the 100-preset limit.');
+    await persistPresets(next);
+    try{if(localStorage.getItem(legacyPresetKey)===raw){localStorage.removeItem(legacyPresetKey);notice('Browser presets imported into this app folder. Browser copy removed.');}else notice('Preset import completed. Browser presets changed during import and were not modified.');}
+    catch{notice('Presets imported. The browser copy could not be removed; use Clear browser presets when storage is accessible.',true);}
+    inspectBrowserPresets();
+  }
+  async function saveWakePreference(value){
+    if(!appStateReady||appStateBusy){$('keepAwake').checked=appPreferences.keepAwake;throw new Error('App settings are not ready for another update.');}
+    appStateBusy=true;updatePresetStorageControls();
+    try{const data=await api('/api/preferences',{preferences:{keepAwake:value},revision:appRevision});appRevision=data.revision;appPreferences={keepAwake:data.preferences?.keepAwake===true};$('keepAwake').checked=appPreferences.keepAwake;wakeDenied=false;await updateWakeLock();}
+    catch(error){if(error.httpStatus===409){await refreshPresets();throw new Error('App settings changed in another window. Settings reloaded; retry the preference change.');}$('keepAwake').checked=appPreferences.keepAwake;throw error;}
+    finally{appStateBusy=false;updatePresetStorageControls();}
+  }
   function recipeForSave(){const recipe={};for(const key of Object.keys(defaults))if(!['source','trim'].includes(key))recipe[key]=clone(settings[key]);return recipe;}
   function validateImported(obj,preserveId=false){
     if(!obj||typeof obj!=='object'||Array.isArray(obj))throw new Error('This file does not contain a recipe object.');
@@ -158,7 +207,7 @@
     }
     for(const key of Object.keys(defaults)){if(['source','trim'].includes(key)||!Object.prototype.hasOwnProperty.call(item.settings,key))continue;const value=item.settings[key];if(['crop','smart','performance'].includes(key)){if(!value||typeof value!=='object'||Array.isArray(value))throw new Error(`Invalid ${key} settings.`);clean[key]={};for(const subkey of Object.keys(defaults[key]))if(Object.prototype.hasOwnProperty.call(value,subkey))clean[key][subkey]=check(`${key}.${subkey}`,value[subkey],defaults[key][subkey]);}else clean[key]=check(key,value,defaults[key]);}
     const legacy={custom:'default',presets:'default',encode:'default',discord:'smart'},mode=legacy[item.mode]||item.mode||'default';
-    if(!['default','smart','advanced'].includes(mode))throw new Error('Unknown recipe goal.');
+    if(!['default','smart','advanced'].includes(mode))throw new Error('Unknown preset mode.');
     if(item.mode==='discord')clean.smart={...defaults.smart,...clean.smart,targetMB:20};
     const id=preserveId&&typeof item.id==='string'&&/^custom-[a-zA-Z0-9-]{1,100}$/.test(item.id)?item.id:presetId();
     return {id,name:String(item.name||'Imported recipe').slice(0,60),mode,settings:clean};
@@ -234,8 +283,8 @@
     if(settings.matte&&!/^#?[a-f\d]{6}$/i.test(settings.matte))throw new Error('Matte color must contain six hexadecimal digits.');
     if(settings.source.kind==='sequence'&&settings.fps*settings.speed>100)throw new Error('For a PNG sequence, frame rate × speed must not exceed 100 fps.');
     if(settings.pipeline==='y4m'&&settings.bounce)throw new Error('Bounce requires the Automatic or PNG pipeline.');
-    if(adaptive()&&settings.smart.pinResolution&&!settings.width&&!settings.height)throw new Error('Enter a width or height for pinned resolution.');
-    if(adaptive()&&settings.smart.pinFps&&settings.fps*(settings.source.kind==='sequence'?settings.speed:1)>50)throw new Error('Pinned playback must not exceed 50 fps. Reduce the frame rate or PNG playback speed.');
+    if(adaptive()&&settings.smart.pinResolution&&!settings.width&&!settings.height)throw new Error('Locked resolution requires a width or height.');
+    if(adaptive()&&settings.smart.pinFps&&settings.fps*(settings.source.kind==='sequence'?settings.speed:1)>50)throw new Error('Locked playback must not exceed 50 fps. Reduce FPS or PNG playback speed.');
     if(adaptive()&&(!$('targetMB').checkValidity()||!Number.isFinite(settings.smart.targetMB)))throw new Error('Enter a file-size limit from 0.01 to 100,000 MB.');
   }
   async function runJob(requestedMode){
@@ -300,7 +349,7 @@
     const complete=results.filter(r=>!r.sample);
     const best=results.find(r=>r.index===job.bestIndex)||results.find(r=>r.best)||complete.filter(r=>budget>0&&r.bytes<=budget).sort((a,b)=>(b.score||0)-(a.score||0))[0]||complete.slice().sort((a,b)=>a.bytes-b.bytes)[0]||results[0];
     const alternatives=results.filter(r=>r!==best);$('resultCount').textContent=`${complete.length} FULL OUTPUT${complete.length===1?'':'S'}${results.length!==complete.length?' · '+(results.length-complete.length)+' SAMPLES':''}`;
-    $('resultSummary').textContent=job.mode==='estimate'?(job.estimate?.exact?'Full trim range measured.':'Sample-based estimate. Sample downloads contain only the tested intervals.'):isSearch?`${activeStatus(job.status)?'Search in progress. ':''}${best.bytes<=budget&&!best.sample?'The selected full GIF fits':activeStatus(job.status)?'No tested full GIF fits yet':'No tested full GIF fits'} ${budget/1000000} MB.${!activeStatus(job.status)&&best.bytes<=budget?' The best tested fit is selected.':''}`:'Your complete GIF is ready to preview and download.';
+    $('resultSummary').textContent=job.mode==='estimate'?(job.estimate?.exact?'Full trim range measured.':'Sample-based estimate. Sample downloads contain only the tested intervals.'):isSearch?`${activeStatus(job.status)?'Search in progress. ':''}${best.bytes<=budget&&!best.sample?'The selected full GIF fits':activeStatus(job.status)?'No tested full GIF fits yet':'No tested full GIF fits'} ${budget/1000000} MB.${!activeStatus(job.status)&&best.bytes<=budget?' The best tested fit is selected.':''}`:'Complete GIF output.';
     $('searchDetails').hidden=!job.searchNote;$('searchDetailsText').textContent=job.searchNote||'';
     $('bestResult').replaceChildren(resultCard(best,job,true,budget));
     $('alternatives').hidden=!alternatives.length;$('alternativesLabel').textContent=`Other tested outputs (${alternatives.length})`;
@@ -314,12 +363,12 @@
     body.append(title,el('div','candidate-info',`${width}${height?' × '+height:' px'} · ${r.fps??r.settings?.fps??'—'} fps · Q${r.quality??r.settings?.quality??'—'}`));
     if(budget>0){const track=el('div','budget-track'),fill=el('div',fit?'':'over');fill.style.width=Math.min(100,r.bytes/budget*100)+'%';track.append(fill);body.append(track,el('p','hint',`${(r.bytes/1000000).toFixed(3)} / ${budget/1000000} MB · ${r.bytes.toLocaleString()} bytes`));}
     const actions=el('div','candidate-actions'),download=el('a','button '+(primary?'primary':'secondary'),r.sample?'Download sample':'Download GIF');download.href=resultURL(r,job,true);download.download=r.filename||'animation.gif';
-    actions.append(download,button('Use settings','button subtle',()=>{const source=clone(settings.source),next=clone(r.settings||job.settings||{});settings={...clone(defaults),...next,source};for(const k of ['crop','smart','trim','performance'])settings[k]={...defaults[k],...next[k]};if(r.sample)settings.trim=clone(job.settings.trim);selectedMode='advanced';selectedPreset=null;sourceMatches.clear();recipeRevision++;syncFields();schedulePlan();notice('Output settings loaded in Advanced.');}));
+    actions.append(download,button('Use settings','button subtle',()=>{const source=clone(settings.source),next=clone(r.settings||job.settings||{});settings={...clone(defaults),...next,source};for(const k of ['crop','smart','trim','performance'])settings[k]={...defaults[k],...next[k]};if(r.sample)settings.trim=clone(job.settings.trim);selectedMode='advanced';selectedPreset=null;sourceMatches.clear();recipeRevision++;syncFields();schedulePlan();notice('Output settings applied to Advanced.');}));
     body.append(actions);card.append(stage,body);return card;
   }
   function renderQueue(){
     $('queueCount').textContent=jobs.length;
-    if(!jobs.length){if(!$('queueList').querySelector('.queue-empty'))$('queueList').replaceChildren(el('div','queue-empty','Your recent jobs will appear here.'));return;}
+    if(!jobs.length){if(!$('queueList').querySelector('.queue-empty'))$('queueList').replaceChildren(el('div','queue-empty','No saved jobs.'));return;}
     $('queueList').querySelector('.queue-empty')?.remove();const ordered=jobs.slice().sort((a,b)=>Number(b.created)-Number(a.created));
     const retained=new Set(ordered.map(job=>job.id));for(const card of [...$('queueList').children])if(!retained.has(card.dataset.jobId))card.remove();
     ordered.forEach((job,index)=>{
@@ -358,13 +407,13 @@
     changed(key);syncFields();
   }
   function renderEstimate(){
-    let estimate=latestEstimateJob?.estimate,job=latestEstimateJob,label='ESTIMATED SIZE',value='Not estimated',state='',range='Run a quick estimate before encoding.',note='Short samples give an approximate range. A full encode verifies the final size.';
+    let estimate=latestEstimateJob?.estimate,job=latestEstimateJob,label='ESTIMATED SIZE',value='Not estimated',state='',range='No size estimate available.',note='Samples produce an approximate range. Complete encoding verifies the output size.';
     if(adaptive()){
       job=currentJob&&['smart','discord'].includes(currentJob.mode)?currentJob:null;estimate=job?.estimate;
-      label='SIZE LIMIT';value=`≤ ${settings.smart.targetMB||'—'} MB`;range='The search measures complete GIFs to verify your limit.';note='Samples guide the choice of dimensions, frame rate, and quality. The final result shows the best tested fit.';
+      label='SIZE LIMIT';value=`≤ ${settings.smart.targetMB||'—'} MB`;range='Complete GIFs are measured against the size limit.';note='Sample encodes guide resolution, FPS, and quality selection. Complete outputs verify the size limit.';
       const best=job?.results?.find(result=>result.index===job.bestIndex&&!result.sample);
       if(best&&job.status==='completed'){label='MEASURED SIZE';value=bytes(best.bytes);range=`${best.bytes.toLocaleString()} bytes · ${Number(job.targetBytes)/1000000} MB limit`;note='Complete output measured. See the result for whether it fits the requested limit.';}
-      else if(estimate){label='LATEST TRIAL';value='≈ '+bytes(estimate.estimatedBytes);range=`${bytes(estimate.lowerBytes)} – ${bytes(estimate.upperBytes)} sampled range`;note='This is a candidate in the ongoing search. The final selected GIF may use different settings and is measured in full.';}
+      else if(estimate){label='LATEST TRIAL';value='≈ '+bytes(estimate.estimatedBytes);range=`${bytes(estimate.lowerBytes)} – ${bytes(estimate.upperBytes)} sampled range`;note='Estimate for the current search candidate. The final output may use different settings and is measured in full.';}
       if(job&&activeStatus(job.status))state='Searching';
     }else if(estimate){
       label=estimate.exact?'MEASURED SIZE':'ESTIMATED SIZE';value=(estimate.exact?'':'≈ ')+bytes(estimate.estimatedBytes);
@@ -372,11 +421,11 @@
       note=estimate.note||note;state=estimate.cacheHit?'Cached':'';
     }
     if(!adaptive()&&job&&activeStatus(job.status)){state='Calculating';if(!estimate)value='Calculating…';}
-    if(job&&jobRevisions.get(job.id)!==recipeRevision){state=state?state+' · stale':'Stale';note+=' Settings have changed since this job; run again to update.';}
-    if(job&&['failed','cancelled'].includes(job.status)){state=job.status==='failed'?'Failed':'Cancelled';note=job.error||'The estimate was cancelled. You can start it again.';}
+    if(job&&jobRevisions.get(job.id)!==recipeRevision){state=state?state+' · stale':'Stale';note+=' Settings changed after this job. Run a new estimate or search.';}
+    if(job&&['failed','cancelled'].includes(job.status)){state=job.status==='failed'?'Failed':'Cancelled';note=job.error||'Estimation cancelled.';}
     setText('estimateLabel',label);setText('estimateValue',value);setText('estimateRange',range);setText('estimateNote',note);
     $('estimateStale').hidden=!state;$('estimateStale').textContent=state;$('estimateSummary').classList.toggle('working',!!job&&activeStatus(job.status));
-    $('estimateJob').textContent=estimatePendingId?'Estimating…':'Estimate size';$('estimateJob').disabled=!!estimatePendingId||!sourceExists()||submitting||uploadBusy||sourceLoading;
+    $('estimateJob').textContent=estimatePendingId?'Estimating…':'Estimate size';$('estimateJob').disabled=!!estimatePendingId||!sourceExists()||submitting||uploadBusy||sourceLoading||!!dependencyState?.blocksEncoding;
   }
   async function updateWakeLock(){
     if(!('wakeLock' in navigator))return;
@@ -388,36 +437,83 @@
       acquired.addEventListener('release',()=>{if(wakeLock===acquired)wakeLock=null;});
       if(!$('keepAwake').checked||document.hidden||!jobs.some(job=>activeStatus(job.status))){wakeLock=null;await acquired.release();return;}
       $('wakeLockStatus').textContent='Screen wake lock active while a job runs and this page is visible.';
-    }catch{wakeDenied=true;$('wakeLockStatus').textContent='This browser could not keep the screen awake. Encoding continues normally.';}
+    }catch{wakeDenied=true;$('wakeLockStatus').textContent='Screen wake lock request rejected. Encoding is unaffected.';}
     finally{wakeRequestPending=false;}
   }
   function allToolsReady(){return ['gifski','ffmpeg','ffprobe'].every(name=>toolsState?.tools?.[name]?.available);}
+  function installationState(){
+    const live=dependencyState?.installation;
+    return dependencyState?.busy&&live?.state!=='idle'?live:installationOverride||live;
+  }
+  function renderDependencyActivity(){
+    const item=installationState(),active=!!dependencyState?.busy||dependencyStarting||['installing','cancelling'].includes(item?.state),visible=!!item&&item.state!=='idle'&&(active||item.id!==dismissedInstallationId);
+    $('dependencyActivity').hidden=$('dependencyIndicator').hidden=!visible;$('setupInstallation').hidden=!item||item.state==='idle';if(!item||item.state==='idle')return;
+    const tool={gifski:'Gifski',ffmpeg:'FFmpeg + FFprobe'}[item.tool]||'Dependencies';
+    const phase={metadata:'Release metadata',download:'Download',extract:'Extraction',verify:'Executable verification',publish:'Installation',cleanup:'Cleanup'}[item.phase];
+    const state=String(item.state||'installing').replaceAll('_',' '),title=active?`${tool} · ${phase||state}`:`${tool} · ${state}`;
+    setText('dependencyActivityTitle',title);setText('dependencyActivityState',state);setText('dependencyIndicator',active?`${tool} · ${item.state==='cancelling'?'cancelling':phase||'installing'}`:`Installation · ${state}`);
+    $('dependencyActivity').classList.toggle('failed',item.state==='failed'||!!item.error);
+    const received=Number(item.bytesReceived)||0,total=Number(item.totalBytes)||0,rate=Number(item.bytesPerSecond)||0,download=item.phase==='download',percent=Number.isFinite(item.progress)?Math.max(0,Math.min(100,item.progress)):download&&total>0?Math.min(100,received/total*100):null;
+    const meter=$('dependencyActivityProgress');if(percent!==null)meter.value=percent;else if(!active)meter.value=item.state==='completed'?100:0;else meter.removeAttribute('value');
+    setText('dependencyTransfer',received||download?`${bytes(received)}${total?' / '+bytes(total):''}${download&&rate?' · '+bytes(rate)+'/s':''}`:'');
+    setText('dependencyPercentage',percent!==null?Math.floor(percent)+'%':'');
+    setText('dependencyTiming',`${seconds(item.elapsedSeconds??0)} elapsed${active&&item.etaSeconds!=null?' · '+seconds(item.etaSeconds)+' remaining':''}`);
+    setText('dependencyActivityMessage',item.message||'');const error=[item.error,dependencyConnectionError].filter(Boolean).join(' ');$('dependencyActivityError').hidden=!error;setText('dependencyActivityError',error);
+    $('cancelDependency').hidden=!active;$('cancelDependency').disabled=!item.canCancel||dependencyCancelPending;$('cancelDependency').textContent=dependencyCancelPending||item.state==='cancelling'?'Cancelling…':'Cancel installation';
+    $('dismissDependencyActivity').hidden=active;
+    setText('setupInstallPhase',title);const setupMeter=$('setupInstallProgress');if(meter.hasAttribute('value'))setupMeter.value=meter.value;else setupMeter.removeAttribute('value');
+    setText('setupInstallTransfer',$('dependencyTransfer').textContent);setText('setupInstallTiming',$('dependencyTiming').textContent);$('setupInstallError').hidden=!error;setText('setupInstallError',error);
+    $('cancelSetupDependency').hidden=!active;$('cancelSetupDependency').disabled=$('cancelDependency').disabled;$('cancelSetupDependency').textContent=$('cancelDependency').textContent;
+  }
   async function refreshDependencies(){
-    if(dependencyBusy)return;dependencyBusy=true;
-    try{dependencyState=await api('/api/dependencies');renderDependencies();if(dependencyState.busy||dependencyState.updates?.state==='checking'){if(!dependencyPoll)dependencyPoll=setInterval(()=>refreshDependencies().catch(showSetupError),1200);}else if(dependencyPoll||Object.values(dependencyState.tools||{}).some(t=>t.state==='completed')){clearInterval(dependencyPoll);dependencyPoll=null;await refreshStatus();renderDependencies();}}
-    finally{dependencyBusy=false;}
+    if(dependencyBusy)return;clearTimeout(dependencyPoll);dependencyPoll=null;dependencyBusy=true;const wasBusy=!!dependencyState?.busy;
+    try{
+      dependencyState=await api('/api/dependencies',undefined,{timeoutMs:15000});dependencyConnectionError='';
+      if(dependencyState.busy&&dependencyState.installation?.state!=='idle')installationOverride=null;
+      renderDependencies();if(wasBusy&&!dependencyState.busy){await refreshStatus();renderDependencies();}
+    }catch(error){dependencyConnectionError='Installation status refresh failed. Retrying. '+error.message;renderDependencyActivity();showSetupError(error);}
+    finally{dependencyBusy=false;dependencyPoll=setTimeout(refreshDependencies,dependencyState?.busy||dependencyState?.updates?.state==='checking'?1000:document.hidden?15000:5000);}
   }
   function showSetupError(error){const message=error.message||String(error);$('setupError').hidden=false;$('setupError').textContent=message;if($('settingsDialog').open)$('versionCheckStatus').textContent=message;}
+  async function startDependencyInstall(tool=null){
+    if(dependencyStarting||dependencyState?.busy)return;dependencyStarting=true;dependencyConnectionError='';dismissedInstallationId=null;
+    installationOverride={id:'request-'+Date.now(),state:'installing',tool,phase:'metadata',elapsedSeconds:0,canCancel:false,message:'Starting dependency installation…'};
+    $('setupError').hidden=true;renderDependencies();renderDependencyActivity();
+    try{dependencyState=await api(tool?'/api/dependencies/install':'/api/dependencies/install-missing',tool?{tool}:{});installationOverride=null;renderDependencies();await refreshDependencies();}
+    catch(error){installationOverride={...installationOverride,id:'request-error-'+Date.now(),state:'failed',tool,phase:'',canCancel:false,message:'Installation request failed.',error:error.message};showSetupError(error);notice(error.message,true);}
+    finally{dependencyStarting=false;renderDependencies();renderDependencyActivity();}
+  }
+  async function cancelDependencyInstall(){
+    if(dependencyCancelPending)return;dependencyCancelPending=true;renderDependencyActivity();
+    try{dependencyState=await api('/api/dependencies/cancel',{});installationOverride=null;renderDependencies();await refreshDependencies();}
+    catch(error){dependencyConnectionError='Cancellation request failed: '+error.message;renderDependencyActivity();throw error;}
+    finally{dependencyCancelPending=false;renderDependencyActivity();}
+  }
   function renderDependencies(){
-    const state=dependencyState;if(!state)return;
-    $('installMissing').hidden=!state.supported||allToolsReady();$('installMissing').disabled=!!state.busy;$('installMissing').textContent=state.busy?'Setting up tools…':'Set up missing tools';
+    renderDependencyActivity();const state=dependencyState;if(!state)return;
+    const busy=!!state.busy||dependencyStarting;
+    $('installMissing').hidden=!state.supported||allToolsReady();$('installMissing').disabled=busy;$('installMissing').textContent=busy?'Installing…':'Install missing tools';
     $('setupProgress').hidden=!state.setup?.message;$('setupProgress').textContent=state.setup?.message||'';
-    $('setupPlatform').textContent=`${state.platform||'This system'} · ${state.supported?'Portable installation available.':'Automatic installation is not available on this platform. Use the guidance below or existing executable paths.'}`;
-    $('dependencyCards').replaceChildren(...['gifski','ffmpeg'].map(name=>{
-      const item=state.tools?.[name]||{},ready=!!toolsState?.tools?.[name]?.available&&(name!=='ffmpeg'||!!toolsState?.tools?.ffprobe?.available),installing=['queued','installing'].includes(item.state);
-      const card=el('div','dependency-card'),heading=el('div','dependency-heading');heading.append(el('strong','',name==='ffmpeg'?'FFmpeg + FFprobe':'Gifski'),el('span','tool-state'+(ready?'':' missing'),ready?'Ready':item.state==='queued'?'Queued':installing?'Installing…':item.state==='failed'?'Installation failed':'Missing'));card.append(heading);
-      const update=state.updates?.tools?.[name]?.state==='update_available',alternative=item.portableUpdateAffectsActive===false;
-      const install=button(installing?'Installing…':ready?(alternative?(item.installed?'Update portable alternative':'Install portable alternative'):update?'Update portable copy':'Installed'):'Install','button secondary compact',safeRun(async()=>{install.disabled=true;$('setupError').hidden=true;try{dependencyState=await api('/api/dependencies/install',{tool:name});renderDependencies();await refreshDependencies();}catch(error){showSetupError(error);await refreshDependencies();}}));install.disabled=(ready&&!update&&!alternative)||!!state.busy||!state.supported;card.append(install);
-      if(alternative)card.append(el('p','hint','Your PATH or configured tool stays active. Update it with its original installer or package manager, or select the downloaded bin/ executable explicitly to use the portable alternative.'));
-      if(item.message)card.append(el('p','hint',item.message));if(item.error)card.append(el('p','error-text',item.error));
-      if(installing){const meter=el('progress');meter.max=100;meter.value=Math.max(0,Math.min(100,Number(item.progress)||0));meter.setAttribute('aria-label',`${name} installation progress`);card.append(meter);}
-      if(!state.supported&&state.manual?.[name])card.append(el('pre','code-block',typeof state.manual[name]==='string'?state.manual[name]:JSON.stringify(state.manual[name],null,2)));
-      return card;
-    }));renderVersionChecks();updateSetup();
+    $('setupPlatform').textContent=`${state.platform||'This system'} · ${state.supported?'Portable installation supported.':'Portable installation unsupported. Configure existing executables or use the platform instructions.'}`;
+    const signature=JSON.stringify([state.tools,state.updates?.tools,state.supported,state.manual,busy,['gifski','ffmpeg','ffprobe'].map(name=>!!toolsState?.tools?.[name]?.available)]);
+    if(signature!==dependencyCardSignature){dependencyCardSignature=signature;
+      $('dependencyCards').replaceChildren(...['gifski','ffmpeg'].map(name=>{
+        const item=state.tools?.[name]||{},ready=!!toolsState?.tools?.[name]?.available&&(name!=='ffmpeg'||!!toolsState?.tools?.ffprobe?.available),installing=['queued','installing','cancelling'].includes(item.state);
+        const card=el('div','dependency-card'),heading=el('div','dependency-heading');heading.append(el('strong','',name==='ffmpeg'?'FFmpeg + FFprobe':'Gifski'),el('span','tool-state'+(ready?'':' missing'),installing?String(item.state):ready?'Available':item.state==='failed'?'Failed':item.state==='cancelled'?'Cancelled':'Missing'));card.append(heading);
+        const update=state.updates?.tools?.[name]?.state==='update_available',alternative=item.portableUpdateAffectsActive===false;
+        const install=button(installing?'Installing…':ready?(alternative?(item.installed?'Update portable alternative':'Install portable alternative'):update?'Update portable copy':'Installed'):'Install','button secondary compact',safeRun(()=>startDependencyInstall(name)));
+        install.disabled=(ready&&!update&&!alternative)||busy||!state.supported;card.append(install);
+        if(alternative)card.append(el('p','hint','The PATH or configured executable remains active. Update it with its original installer or package manager, or select the downloaded bin/ executable explicitly.'));
+        if(item.message)card.append(el('p','hint',item.message));if(item.error)card.append(el('p','error-text',item.error));
+        if(!state.supported&&state.manual?.[name])card.append(el('pre','code-block',typeof state.manual[name]==='string'?state.manual[name]:JSON.stringify(state.manual[name],null,2)));
+        return card;
+      }));
+    }
+    renderVersionChecks();updateSetup();updateRecipe();
   }
   function updateSetup(){
     $('setupNext').disabled=!allToolsReady();
-    $('setupReadyNote').textContent=allToolsReady()?'All tools are ready.':'Connect all three tools to get started.';
+    $('setupReadyNote').textContent=allToolsReady()?'All required executables are available.':'Gifski, FFmpeg, and FFprobe are required.';
   }
   function renderVersionChecks(){
     const updates=dependencyState?.updates;if(!updates)return;
@@ -462,31 +558,30 @@
   $('fixedColors').addEventListener('input',()=>{settings.fixedColors=$('fixedColors').value.split(/[\s,;]+/).filter(Boolean);changed('fixedColors');});
   $('loopMode').addEventListener('change',()=>{settings.repeat=$('loopMode').value==='once'?-1:$('loopMode').value==='forever'?0:1;$('repeatField').hidden=settings.repeat<=0;$$('[data-key="repeat"]')[0].disabled=settings.repeat<=0;$$('[data-key="repeat"]')[0].value=settings.repeat;changed('repeat');});
   $('savePreset').addEventListener('click',safeRun(()=>{$('presetName').value='';$('presetDialog').showModal();}));
-  $('confirmPreset').addEventListener('click',event=>{
-    if(!$('presetName').value.trim()){event.preventDefault();return;}
-    const previous=customPresets.slice();
-    try{
-      const name=$('presetName').value.trim(),item=validateImported({name,mode:selectedMode,settings:recipeForSave()}),existing=customPresets.findIndex(preset=>preset.name===name);
-      if(existing>=0){item.id=customPresets[existing].id;customPresets[existing]=item;}else{if(customPresets.length>=100)throw new Error('Delete or export a saved preset before adding another (100 maximum).');customPresets.push(item);}
-      persistPresets();selectedPreset=item.id;renderPresets();updateRecipe();notice(`Saved “${name}”.`);
-    }catch(error){customPresets=previous;event.preventDefault();notice(error.message,true);}
+  $('cancelPreset').addEventListener('click',()=>$('presetDialog').close());
+  $('presetForm').addEventListener('submit',event=>{
+    event.preventDefault();safeRun(async()=>{
+      const name=$('presetName').value.trim();if(!name)throw new Error('Enter a preset name.');
+      const item=validateImported({name,mode:selectedMode,settings:recipeForSave()}),next=customPresets.slice(),existing=next.findIndex(preset=>preset.name===name);
+      if(existing>=0){item.id=next[existing].id;next[existing]=item;}else{if(next.length>=100)throw new Error('Preset storage contains 100 entries. Delete one before saving.');next.push(item);}
+      await persistPresets(next);selectedPreset=item.id;renderPresets();updateRecipe();$('presetDialog').close();notice(`Preset saved: ${name}`);
+    })();
   });
   $('exportPreset').addEventListener('click',safeRun(()=>{
-    const saved=validateImported({name:customPresets.find(item=>item.id===selectedPreset)?.name||'My Gifski recipe',mode:selectedMode,settings:recipeForSave()});
+    const saved=validateImported({name:customPresets.find(item=>item.id===selectedPreset)?.name||'Gifski preset',mode:selectedMode,settings:recipeForSave()});
     const blob=new Blob([JSON.stringify({format:'gifski-webui-recipe',version:2,name:saved.name,mode:saved.mode,settings:saved.settings},null,2)],{type:'application/json'});
     const url=URL.createObjectURL(blob),link=el('a');link.href=url;link.download='gifski-recipe.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
   }));
   $('importPreset').addEventListener('change',safeRun(async()=>{
-    const file=$('importPreset').files[0];if(!file)return;const previous=customPresets.slice();
-    try{if(customPresets.length>=100)throw new Error('Delete a saved preset before importing another (100 maximum).');if(file.size>100000)throw new Error('Recipe files must be smaller than 100 KB.');const preset=validateImported(JSON.parse(await file.text()));customPresets.push(preset);persistPresets();applyPreset(preset);notice('Recipe imported. Review the settings before encoding.');}
-    catch(error){customPresets=previous;throw error;}finally{$('importPreset').value='';}
+    const file=$('importPreset').files[0];if(!file)return;
+    try{if(customPresets.length>=100)throw new Error('Preset storage contains 100 entries. Delete one before importing.');if(file.size>100000)throw new Error('Preset files must be smaller than 100 KB.');const preset=validateImported(JSON.parse(await file.text()));await persistPresets([...customPresets,preset]);applyPreset(customPresets.find(item=>item.id===preset.id));notice('Preset imported.');}
+    finally{$('importPreset').value='';}
   }));
   $('recipeSelect').addEventListener('change',()=>{const preset=[...builtinPresets,...customPresets].find(item=>item.id===$('recipeSelect').value);if(preset)applyPreset(preset);});
-  $('deletePreset').addEventListener('click',safeRun(()=>{
-    const previous=customPresets.slice();customPresets=customPresets.filter(item=>item.id!==selectedPreset);
-    try{persistPresets();}catch(error){customPresets=previous;throw error;}
-    selectedPreset=null;renderPresets();updateRecipe();notice('Saved recipe deleted. Current settings are preserved.');
-  }));
+  $('deletePreset').addEventListener('click',safeRun(async()=>{const id=selectedPreset;await persistPresets(customPresets.filter(item=>item.id!==id));if(selectedPreset===id)selectedPreset=null;renderPresets();updateRecipe();notice('Preset deleted. Current settings retained.');}));
+  $('reloadPresets').addEventListener('click',safeRun(refreshPresets));
+  $('importBrowserPresets').addEventListener('click',safeRun(importBrowserPresets));
+  $('clearBrowserPresets').addEventListener('click',safeRun(()=>{localStorage.removeItem(legacyPresetKey);inspectBrowserPresets();notice('Browser presets cleared. App-folder presets are unchanged.');}));
   $('fileInput').addEventListener('change',safeRun(e=>uploadFiles(e.target.files)));
   $('uploadArea').addEventListener('click',()=>$('fileInput').click());$('uploadArea').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('fileInput').click();}});
   for(const name of ['dragenter','dragover'])$('uploadArea').addEventListener(name,e=>{e.preventDefault();$('uploadArea').classList.add('dragover');});
@@ -528,16 +623,14 @@
     catch(error){$('versionCheckStatus').textContent=error.message;dependencyState={...(dependencyState||{}),updates:{state:'failed',message:error.message,tools:dependencyState?.updates?.tools||{}}};throw error;}
     finally{versionRequestPending=false;renderVersionChecks();}
   }));
-  $('installMissing').addEventListener('click',safeRun(async()=>{
-    $('installMissing').disabled=true;$('setupError').hidden=true;
-    try{dependencyState=await api('/api/dependencies/install-missing',{});renderDependencies();await refreshDependencies();}
-    catch(error){showSetupError(error);await refreshDependencies();}
-  }));
-  $('keepAwake').addEventListener('change',()=>{wakeDenied=false;try{localStorage.setItem('gifski-keep-awake',String($('keepAwake').checked));}catch{}updateWakeLock();});
-  try{$('keepAwake').checked=localStorage.getItem('gifski-keep-awake')==='true';}catch{}
-  if(!('wakeLock' in navigator)){$('keepAwake').disabled=true;$('wakeLockStatus').textContent='Screen wake lock is unavailable in this browser. Encoding still works normally.';}
-  document.addEventListener('visibilitychange',()=>{if(!document.hidden)wakeDenied=false;updateWakeLock();if(!document.hidden)pollJobs();else schedulePoll();});
+  $('installMissing').addEventListener('click',safeRun(()=>startDependencyInstall()));
+  $('dependencyIndicator').addEventListener('click',safeRun(openSetup));$('dependencyDetails').addEventListener('click',safeRun(openSetup));
+  $('cancelDependency').addEventListener('click',safeRun(cancelDependencyInstall));$('cancelSetupDependency').addEventListener('click',safeRun(cancelDependencyInstall));
+  $('dismissDependencyActivity').addEventListener('click',()=>{dismissedInstallationId=installationState()?.id;renderDependencyActivity();});
+  $('keepAwake').addEventListener('change',safeRun(()=>saveWakePreference($('keepAwake').checked)));
+  if(!('wakeLock' in navigator)){$('keepAwake').disabled=true;$('wakeLockStatus').textContent='Screen wake lock is unsupported. Encoding is unaffected.';}
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)wakeDenied=false;updateWakeLock();if(!document.hidden){pollJobs();refreshDependencies();}else schedulePoll();});
   if('ResizeObserver' in window)new ResizeObserver(()=>document.documentElement.style.setProperty('--toolbar-height',$('actionbar').getBoundingClientRect().height+'px')).observe($('actionbar'));
-  syncFields();refreshStatus().then(checkSetup).catch(e=>{notice(e.message,true);$('engineStatus').textContent='Local server unavailable';});pollJobs();
+  syncFields();inspectBrowserPresets();refreshPresets().catch(error=>notice(error.message,true));refreshStatus().then(async()=>{await refreshDependencies();await checkSetup();}).catch(e=>{notice(e.message,true);$('engineStatus').textContent='Local server unavailable';});pollJobs();
 
 })();

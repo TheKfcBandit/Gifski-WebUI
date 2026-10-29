@@ -1,6 +1,6 @@
 # Gifski WebUI design
 
-## Product philosophy
+## Interface principles
 
 The task is to make a useful GIF. Organize the interface around three decisions: start from a recipe, fit a size, or control the encoder manually. These map to **Default**, **Smart**, and **Advanced**. Recipes and sharing limits are choices within those modes, not additional modes. A complete result’s measured byte count determines whether it fits.
 
@@ -61,6 +61,14 @@ Show the executable actually in use, its detection origin, and its reported vers
 Online version checking starts asynchronously and refreshes local detection before comparing upstream releases. Reuse recent successful upstream metadata while still refreshing installed versions. Publish independent provider results promptly and expose actionable sanitized errors. A recognized vendor stable build can match the upstream release while vendor package revisions remain outside that comparison. Nightly/Git/prerelease/unrecognized builds receive explicit uncertain states.
 
 Installing into `bin/` updates an app-local copy. It does not replace or activate over a working PATH or explicit executable. Version UI explains the appropriate update route instead of implying that a download changed a different installation.
+
+## State ownership and installation lifecycle
+
+The source/CMD launcher stores presets, preferences, jobs, and installed engines under its own runtime folder. The browser is a client: it holds a temporary authentication cookie and current form state, not the persistent preset database. A frozen executable uses a dedicated user-data folder separate from bundled assets. Old browser presets require an explicit import or clear action. Saves use a validated, bounded JSON store, atomic replacement, and revision checks so stale windows cannot overwrite newer changes.
+
+Installation status belongs beside process status, not only inside Settings. Reopening the page reads the current worker state. Show measured download progress and elapsed time, indicate unknown totals, and expose cancellation throughout the operation. Keep cancellation pending until staged files are cleaned up; never unblock replacement-sensitive jobs early. Installing an inactive portable alternative may permit jobs using external engines. Prevent path changes until installation ends.
+
+Use direct technical labels: Size limit, Lock resolution, Lock FPS, Download, Cancel, and Reload. Explanatory text should describe a constraint or operation, not reassure or advertise.
 
 ## Hardening boundaries
 

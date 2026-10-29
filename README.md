@@ -1,5 +1,9 @@
 # Gifski WebUI
 
+[![Checks](https://github.com/TheKfcBandit/Gifski-WebUI/actions/workflows/checks.yml/badge.svg)](https://github.com/TheKfcBandit/Gifski-WebUI/actions/workflows/checks.yml)
+
+[Feature reference](FEATURES.md) · [Design](DESIGN.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Report a bug](https://github.com/TheKfcBandit/Gifski-WebUI/issues/new/choose)
+
 A local browser interface for Gifski and FFmpeg. Choose a recipe, estimate file size, or let Smart search for a high-quality GIF within your size limit. Advanced exposes every Gifski CLI encoding option.
 
 ## Start
@@ -10,7 +14,7 @@ A local browser interface for Gifski and FFmpeg. Choose a recipe, estimate file 
 2. Install **Python 3.10 or newer** from [python.org](https://www.python.org/downloads/) if needed.
 3. Double-click **Start-Windows.cmd**. Keep its terminal open.
 4. Follow the dependency setup wizard. Automatic detection checks PATH before the app’s `bin/` folder. **Settings** shows each active executable, version, and detection source; an explicit path overrides automatic detection.
-5. On Windows x64, choose **Set up missing tools** to download missing dependencies into the app’s `bin/` folder. Existing PATH tools are kept. Downloads require an install action; no administrator access or PATH changes are needed. FFprobe is included with FFmpeg.
+5. On Windows x64, choose **Install missing tools** to download missing dependencies into the app’s `bin/` folder. Existing PATH tools are kept. Downloads require an install action; no administrator access or PATH changes are needed. FFprobe is included with FFmpeg.
 
 The browser opens at `http://127.0.0.1:8765`. No pip packages, Node.js, account, or web build is required. Installing dependencies needs an internet connection; ordinary encoding stays local.
 
@@ -39,7 +43,7 @@ Default includes Balanced, Compact, Fidelity, UI & text, Motion, and Transparent
 
 Smart uses a customizable **decimal MB** limit: `20 MB` means exactly `20,000,000 bytes`. Short samples guide the search; a fit is confirmed only when a complete GIF is measured at or below the limit.
 
-By default, Smart can vary resolution, frame rate, and encoder quality. **Pin resolution** fixes the requested dimensions throughout the search; leave one dimension blank to preserve proportions. Smart does not upscale beyond the cropped source and rejects pinned resolutions above its 16-megapixel safety limit. **Pin frame rate** fixes the chosen FPS. GIF playback is limited to 50 FPS here; PNG sequence timing also includes the playback-speed multiplier. With both axes pinned, Smart searches quality and permitted encoder effort rather than quietly reducing dimensions or frame rate. If no tested candidate fits, it reports that result and suggests releasing a pin, shortening the clip, or increasing the limit.
+By default, Smart can vary resolution, frame rate, and encoder quality. **Lock resolution** fixes the requested dimensions throughout the search; leave one dimension blank to preserve proportions. Smart does not upscale beyond the cropped source and rejects pinned resolutions above its 16-megapixel safety limit. **Lock FPS** fixes the chosen FPS. GIF playback is limited to 50 FPS here; PNG sequence timing also includes the playback-speed multiplier. With both axes pinned, Smart searches quality and permitted encoder effort rather than quietly reducing dimensions or frame rate. If no tested candidate fits, it reports that result and suggests releasing a pin, shortening the clip, or increasing the limit.
 
 Search effort controls the candidate budget. Thorough can also verify Extra encoder effort on a fitting candidate. The search tests changes with substantial size impact before small quality refinements, reuses compatible prepared frames, and stops when tested gains diminish or its budget is spent. It preserves your chosen clip, crop, playback, and image processing; it never silently trims to fit.
 
@@ -109,11 +113,25 @@ Version results show the active path, detection source, installed version, upstr
 
 - The ordinary launcher binds only to `127.0.0.1`. No analytics, external UI scripts, cloud encoding, or accounts.
 - Inputs are not overwritten. Jobs, outputs, and thumbnail caches use unique folders under `data/jobs`; upload copies live under `data/uploads`.
-- Executable paths and job history stay local. Saved recipes use browser storage; export them for a portable backup.
+- Executable paths, job history, saved recipes, and interface preferences are stored beneath the runtime folder. Saved recipes use `data/presets.json`; no new presets or preferences are written to browser storage.
 - `data/`, `bin/`, caches, virtual environments, and environment files are ignored by Git. Do not commit media, configuration, or diagnostic logs containing local paths.
 - Jobs run serially. Cancellation retains finished candidates; restart marks unfinished jobs interrupted. Expected browser disconnects do not trigger a second HTTP response or a traceback.
 - Close the app before removing old files under `data/` to reclaim space.
 - Custom FFmpeg filters and local paths are trusted local-operator features. Do not expose the server to the internet; development preview mode is only for an isolated preview environment.
+
+### Portable data and updates
+
+Running `Start-Windows.cmd`, `start.sh`, or `server.py` keeps writable app data inside the extracted application folder, independently of the current working directory. A new folder starts with no saved recipes. Preserve `data/` and `bin/` when replacing source files to keep settings, history, presets, and installed dependencies. Delete the app folder to remove that copy's managed data. Original source media and explicit exports/downloads remain wherever you put them.
+
+Versions through 1.4 used browser storage for presets and the wake-lock preference. The app does not automatically restore those old presets into each fresh folder. Use **Import browser presets** to copy them into this app's recipe store; browser entries are removed only after successful persistence. **Clear browser presets** discards the legacy entries without importing them. JSON import/export remains available. Browser session cookies are temporary authentication, not app settings.
+
+A frozen Windows executable uses `%LOCALAPPDATA%/Gifski WebUI` as its writable runtime folder, separate from bundled assets. The current repository checks validate source and do not publish an EXE package.
+
+### Installation status and recovery
+
+Dependency downloads run in the launcher, independently of an open browser tab or Settings dialog. The activity column and setup dialog display the tool, phase, downloaded bytes, elapsed time, rate, and remaining time when available. Reopening the page reconnects to the same installation. Use **Cancel installation** to stop the operation; cancellation remains pending until cleanup has finished. Closing the launcher stops the process; restart clears any in-memory operation state.
+
+Downloads use an 8-second socket timeout, a 45-second inactivity limit, and a 20-minute overall limit. If an OS operation remains stalled after cancellation, cleanup stays visible and another installer cannot start; encoding can resume only when the cancelled operation can no longer publish files. A timeout or failed checksum leaves the existing executables intact. Updating an active app-local encoder blocks new jobs until replacement finishes. Downloading an inactive portable alternative can leave encoding available through working external PATH/configured tools. Executable path changes stay blocked during installation so the active files cannot switch during replacement.
 
 ## Development
 
@@ -132,8 +150,10 @@ Node is optional and used only for the syntax check. Unit tests use temporary da
 | `engine.py` | Probing, pipelines, queue, estimates, and optimization |
 | `dependencies.py` | Portable installation and version checks |
 | `thumbnails.py` | Bounded static history thumbnail cache |
+| `presets.py` | Validated app-local presets with revision checks |
 | `static/` | Browser UI |
-| `test_*.py` | Engine, HTTP, installer, and thumbnail tests |
+| `test_*.py` | Engine, HTTP, installer, preset, and thumbnail tests |
+| `.github/` | CI and issue/PR templates |
 | `FEATURES.md` | Gifski feature coverage |
 | `DESIGN.md` | Layout philosophy, search strategy, and hardening boundaries |
 
